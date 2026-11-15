@@ -1,0 +1,99 @@
+{
+  "pyarrow_version": "26.0.1",
+  "tvpl": {
+    "path": "dataset/nguon-luat/thuvienphapluat-vn-vbpl",
+    "document_shards": 96,
+    "counts": {
+      "rows": 573851,
+      "doc_number_nonblank_rows": 185828,
+      "issue_date_nonblank_rows": 26668,
+      "effective_date_nonblank_rows": 19483,
+      "status_nonblank_rows": 19962,
+      "pdf_url_nonblank_rows": 572914,
+      "metadata_vn_chars_positive_rows": 572914,
+      "metadata_num_articles_positive_rows": 313172,
+      "is_english_true_rows": 15622,
+      "id_null_rows": 0,
+      "unique_nonnull_ids": 573851,
+      "duplicate_nonnull_id_rows": 0
+    },
+    "doc_types": {
+      "Quyết định": 264431,
+      "Công văn": 127394,
+      "Nghị quyết": 43984,
+      "Kế hoạch": 34228,
+      "Thông tư": 24536,
+      "<null>": 22629,
+      "Thông báo": 16154,
+      "Chỉ thị": 15337,
+      "Nghị định": 9380,
+      "Văn bản hợp nhất": 4595,
+      "Thông tư liên tịch": 2386,
+      "Hướng dẫn": 2112,
+      "Báo cáo": 1580,
+      "Luật": 1190,
+      "Sắc lệnh": 992,
+      "Lệnh": 930,
+      "Hiệp định": 456,
+      "Pháp lệnh": 358,
+      "Quy định": 351,
+      "TCVN": 300,
+      "Quy chế": 207,
+      "Công ước": 148,
+      "Nghị quyết liên tịch": 54,
+      "Điều lệ": 33,
+      "Bộ luật": 33,
+      "Quy chuẩn": 19,
+      "Công bố": 15,
+      "Điều ước": 8,
+      "Hiến pháp": 6,
+      "Sắc luật": 5
+    },
+    "sections": {
+      "van-ban": 427436,
+      "cong-van": 127471,
+      "TCVN": 18944
+    },
+    "scope": "All document rows; scalar metadata only; text completeness not independently checked"
+  },
+  "phapdien": {
+    "path": "dataset/nguon-luat/phapdien-moj-gov-vn",
+    "document_shards": 7,
+    "counts": {
+      "rows": 65967,
+      "metadata_content_positive_rows": 65538,
+      "metadata_content_empty_or_null_rows": 429,
+      "record_id_null_rows": 0,
+      "article_id_null_rows": 0,
+      "source_note_nonblank_rows": 65959,
+      "source_links_nonempty_rows": 65959,
+      "note_with_instrument_number_pattern_rows": 65322,
+      "note_with_original_article_prefix_rows": 65928,
+      "note_with_effective_date_phrase_rows": 65959,
+      "rows_with_vbpl_itemid_link": 65959,
+      "unique_nonnull_record_ids": 65967,
+      "duplicate_nonnull_record_id_rows": 0,
+      "unique_nonnull_article_ids": 65761,
+      "duplicate_nonnull_article_id_rows": 206,
+      "unique_complete_subject_article_keys": 65826,
+      "duplicate_complete_subject_article_key_rows": 141
+    },
+    "source_note_example": {
+      "record_id": "07e896d5a9003e01",
+      "article_id": "Điều 1.1.LQ.1",
+      "source_note_text": "(Điều 1 Luật số 32/2004/QH11 An ninh Quốc gia ngày 03/12/2004 của Quốc hội, có hiệu lực thi hành kể từ ngày 01/07/2005 )",
+      "source_links": [
+        {
+          "text": "(Điều 1 Luật số 32/2004/QH11 An ninh Quốc gia ngày 03/12/2004 của Quốc hội, có hiệu lực thi hành kể từ ngày 01/07/2005 )",
+          "href": "http://vbpl.vn/TW/Pages/vbpq-toanvan.aspx?ItemID=18562#Chuong_I_Dieu_1"
+        }
+      ]
+    },
+    "scope": "All document rows; source-note regex matches are unverified extraction candidates"
+  },
+  "limitations": [
+    "No judgment-to-statute resolution, temporal validity checking, or legal annotation was performed.",
+    "Positive length and article counts are publisher metadata, not independent full-text quality checks.",
+    "Source-note patterns and source links do not prove correctness of a version or cross-corpus mapping."
+  ]
+}

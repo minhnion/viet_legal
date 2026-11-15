@@ -1,0 +1,59 @@
+# Local configuration and credentials; keep the shareable template.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Downloaded corpora and generated pipeline artifacts.
+/dataset/
+/outputs/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+
+# Python environments and bytecode.
+.venv/
+venv/
+env/
+ENV/
+.conda/
+__pycache__/
+*.py[cod]
+
+# Test, coverage, lint and type-check caches.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.cache/
+
+# Python build and packaging artifacts.
+/build/
+/dist/
+*.egg-info/
+.eggs/
+
+# Logs, temporary files and local editor state.
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+.ipynb_checkpoints/
+.idea/
+.vscode/
+
+# Operating-system metadata.
+.DS_Store
+Thumbs.db
+Desktop.ini

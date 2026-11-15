@@ -1,0 +1,7 @@
+huggingface_hub==2.4.0
+pyarrow>=18,<27
+requests>=2.32,<3
+python-dotenv>=1.0,<2
+jsonschema>=4.23,<5
+pytest>=8,<10
+filelock>=3.15,<5
