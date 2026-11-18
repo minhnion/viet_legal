@@ -17,6 +17,10 @@ class ConfigError(ValueError):
     pass
 
 
+# Model-backed stages: ISSUE builds issues/queries from court citations, EVIDENCE confirms sources and picks clauses.
+STAGES = ("ISSUE", "EVIDENCE", "AUGMENT")
+
+
 def canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -50,7 +54,6 @@ class Profile:
     token_parameter: str = "max_tokens"
     max_output_tokens: int = 2048
     context_tokens: int = 32768
-    max_input_chars: int = 12000
     timeout: float = 180
     retries: int = 2
     retry_backoff: float = 1
@@ -81,13 +84,7 @@ class Config:
     categories: tuple = ()
     case_ids: tuple = ()
     seed: int = 20261115
-    pool_size: int = 20
-    link_candidates: int = 8
     max_issues: int = 3
-    max_citations: int = 40
-    max_source_windows: int = 0
-    max_expansion_rounds: int = 1
-    verifier_enabled: bool = True
     fail_fast: bool = False
     train_ratio: float = 0.8
     dev_ratio: float = 0.1
@@ -95,7 +92,13 @@ class Config:
     fewshot_file: Path | None = None
     vision_manifest: Path | None = None
     official_domains: tuple = ("vbpl.vn", "vbpl.moj.gov.vn", "vanban.chinhphu.vn", "congbao.chinhphu.vn", "phapdien.moj.gov.vn", "datafiles.chinhphu.vn")
-    sentence_chunk_size: int = 12
+    # Per-stage max output tokens (e.g. {"EVIDENCE": 1536}); stages not listed use the profile default.
+    stage_max_output_tokens: dict = field(default_factory=dict)
+    # Optional Langfuse OTLP tracing; disabled unless RR_LANGFUSE_HOST is set.
+    langfuse_host: str | None = None
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = field(default="", repr=False)
+    langfuse_capture_io: bool = False
 
     @property
     def db_path(self) -> Path:
@@ -110,6 +113,8 @@ class Config:
     def public(self) -> dict:
         result = {}
         for key, value in self.__dict__.items():
+            if key == "langfuse_secret_key":
+                continue
             if key == "profiles":
                 result[key] = {n: p.public() for n, p in value.items()}
             elif isinstance(value, Path):
@@ -207,7 +212,6 @@ def load_config(path: str | Path) -> Config:
             name, url, get(prefix + "MODEL"), key, auth, output_mode, token_param,
             number(prefix + "MAX_OUTPUT_TOKENS", 2048, 128),
             number(prefix + "CONTEXT_TOKENS", 32768, 1024),
-            number(prefix + "MAX_INPUT_CHARS", 12000, 256),
             number(prefix + "TIMEOUT", 180, 1, False),
             number(prefix + "RETRIES", 2), number(prefix + "RETRY_BACKOFF", 1, 0, False),
             number(prefix + "CONCURRENCY", 1, 1), temp, extra, modalities, role,
@@ -217,7 +221,7 @@ def load_config(path: str | Path) -> Config:
             raise ConfigError(f"Output budget exceeds context for {name}")
         profiles[name] = profile
     default = get("DEFAULT_PROFILE", names[0]).upper()
-    stages = {stage: get(f"PROFILE_{stage}", default).upper() for stage in ["P1", "P2", "P3", "P4", "P5", "P6", "AUGMENT"]}
+    stages = {stage: get(f"PROFILE_{stage}", default).upper() for stage in STAGES}
     vision = get("PROFILE_P0V", "").upper()
     if vision:
         stages["P0V"] = vision
@@ -229,17 +233,31 @@ def load_config(path: str | Path) -> Config:
     dev = number("DEV_RATIO", 0.1, 0, False)
     if train + dev > 1:
         raise ConfigError("TRAIN_RATIO + DEV_RATIO must be <= 1")
+    try:
+        stage_caps = json.loads(get("STAGE_MAX_OUTPUT_TOKENS", "{}"))
+    except (ValueError, TypeError):
+        raise ConfigError("RR_STAGE_MAX_OUTPUT_TOKENS must be a JSON object") from None
+    if not isinstance(stage_caps, dict) or any(k not in set(STAGES) | {"P0V"} or not isinstance(v, int) or v < 128 for k, v in stage_caps.items()):
+        raise ConfigError("RR_STAGE_MAX_OUTPUT_TOKENS must map stage names to integers >= 128")
+    langfuse_host = get("LANGFUSE_HOST", "").rstrip("/") or None
+    langfuse_public, langfuse_secret = get("LANGFUSE_PUBLIC_KEY", ""), get("LANGFUSE_SECRET_KEY", "")
+    if langfuse_host:
+        parts = urlsplit(langfuse_host)
+        if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
+            raise ConfigError("RR_LANGFUSE_HOST must be an HTTP root URL without credentials/query/fragment")
+        if not langfuse_public.strip() or not langfuse_secret.strip():
+            raise ConfigError("RR_LANGFUSE_PUBLIC_KEY and RR_LANGFUSE_SECRET_KEY are required when RR_LANGFUSE_HOST is set")
     return Config(
         path, resolve("JUDGMENTS_PATH"), resolve("TVPL_PATH"), resolve("PHAPDIEN_PATH"),
         resolve("OUTPUT_DIR"), resolve("PROMPTS_FILE"), profiles, stages,
         number("LAW_MAX_RECORDS", 0), number("CASE_MAX_RECORDS", 0), number("ANNOTATION_LIMIT", 50),
         array("CATEGORIES"), array("CASE_IDS"), number("SEED", 20261115),
-        number("POOL_SIZE", 20, 1), number("LINK_CANDIDATES", 8, 1), number("MAX_ISSUES", 3, 1),
-        number("MAX_CITATIONS", 40, 1), number("MAX_SOURCE_WINDOWS", 0), number("MAX_EXPANSION_ROUNDS", 1),
-        boolean(get("VERIFIER_ENABLED", "true"), "VERIFIER_ENABLED"),
+        number("MAX_ISSUES", 3, 1),
         boolean(get("FAIL_FAST", "false"), "FAIL_FAST"), train, dev,
         resolve("FAMILY_MAP", optional=True), resolve("FEWSHOT_FILE", optional=True),
         resolve("VISION_MANIFEST", optional=True),
         array("OFFICIAL_DOMAINS", '["vbpl.vn","vbpl.moj.gov.vn","vanban.chinhphu.vn","congbao.chinhphu.vn","phapdien.moj.gov.vn","datafiles.chinhphu.vn"]'),
-        number("SENTENCE_CHUNK_SIZE", 12, 2),
+        stage_caps,
+        langfuse_host, langfuse_public, langfuse_secret,
+        boolean(get("LANGFUSE_CAPTURE_IO", "false"), "LANGFUSE_CAPTURE_IO"),
     )

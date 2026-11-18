@@ -23,39 +23,20 @@ def strings(enum=None):
     return array(string(enum))
 
 
-ROLES = ["facts_reported", "party_request", "procedural_history", "party_argument", "prosecution_position", "court_reasoning", "operative_decision", "administration", "mixed", "uncertain"]
-LABELS = ["core_candidate", "supporting", "not_relevant", "uncertain"]
+RELEVANCE = ["core", "supporting", "not_relevant"]
 
 
-def schema(stage, sentence_ids=(), candidate_ids=(), max_issues=3):
-    if stage == "P1":
-        return obj({"sentence_roles": array(obj({"sentence_id": string(sentence_ids), "role": string(ROLES),
-                    "speaker": string(), "dispute_status": string(["disputed", "undisputed", "unknown"])})),
-                    "usable_fact_ids": strings(sentence_ids), "context_needed": strings(), "uncertainties": strings()})
-    if stage == "P2":
-        result = obj({"issues": array(obj({"issue_id": string([f"i{i+1}" for i in range(max_issues)]),
-                     "issue_text": string(), "query_text": string(), "fact_support_ids": strings(sentence_ids),
-                     "missing_facts": strings(), "query_status": string(["answerable", "needs_clarification", "insufficient_facts"])}))})
-        result["properties"]["issues"]["maxItems"] = max_issues
-        return result
-    if stage == "P3":
-        return obj({"selected_candidate_ids": strings(candidate_ids),
-                    "resolution_status": string(["candidate_resolved", "ambiguous_act", "ambiguous_version", "not_found_in_candidates", "conflict"]),
-                    "support_sentence_ids": strings(sentence_ids), "ambiguity_reason": string(), "missing_evidence": strings()})
-    if stage == "P4":
-        return obj({"candidate_id": string(candidate_ids), "relevance_proposal": string(LABELS),
-                    "version_status": string(["supported", "contradicted", "unresolved"]),
-                    "evidence_quotes": strings(), "source_roles": strings(),
-                    "short_justification": string(), "missing_context": strings()})
-    if stage == "P5":
-        return obj({"proposed_requirement_groups": array(obj({"group_id": string(), "candidate_ids": strings(candidate_ids), "reason": string()})),
-                    "redundant_sources": strings(candidate_ids), "unresolved_version_conflicts": strings(),
-                    "missing_source_requests": strings(), "review_reasons": strings()})
-    if stage == "P6":
-        return obj({"checks": array(obj({"criterion": string(), "status": string(["pass", "fail", "uncertain"]),
-                    "evidence_ids": strings(candidate_ids), "reason": string()})),
-                    "independent_relevance": array(obj({"candidate_id": string(candidate_ids), "relevance_proposal": string(LABELS)})),
-                    "review_reasons": strings()})
+def schema(stage, fact_ids=(), citation_ids=(), clause_ids=(), max_issues=3):
+    if stage == "ISSUE":
+        issue = obj({"issue_id": string([f"i{i + 1}" for i in range(max_issues)]),
+                     "citation_ids": {**strings(citation_ids), "minItems": 1},
+                     "fact_ids": {**strings(fact_ids), "minItems": 1},
+                     "issue_text": {**string(), "maxLength": 400}, "query_text": {**string(), "maxLength": 500}})
+        return obj({"issues": {**array(issue), "maxItems": max_issues},
+                    "unused_citation_ids": strings(citation_ids)})
+    if stage == "EVIDENCE":
+        return obj({"assessments": array(obj({"source_id": string(citation_ids), "relevance": string(RELEVANCE),
+                                              "clause_ids": strings(clause_ids), "reason": {**string(), "maxLength": 400}}))})
     if stage == "P0V":
         return obj({"transcription": string(), "uncertain_regions": strings(), "proposed_corrections": strings()})
     if stage == "AUGMENT":
@@ -72,13 +53,13 @@ class PromptBank:
             raise ValueError("Prompt document has no common text block")
         self.common = common.group(1)
         self.prompts = {}
-        headings = list(re.finditer(r"(?m)^##\s+\d+\s+(P\dV?|AUGMENT)\b[^\n]*", text))
+        headings = list(re.finditer(r"(?m)^##\s+\d+\s+(ISSUE|EVIDENCE|P0V|AUGMENT)\b[^\n]*", text))
         for i, heading in enumerate(headings):
             section = text[heading.end():headings[i + 1].start() if i + 1 < len(headings) else len(text)]
             prompt = re.search(r"```text\n(.*?)\n```", section, re.S)
             if prompt:
                 self.prompts[heading.group(1)] = prompt.group(1)
-        missing = {"P1", "P2", "P3", "P4", "P5", "P6", "P0V"} - self.prompts.keys()
+        missing = {"ISSUE", "EVIDENCE"} - self.prompts.keys()
         if missing:
             raise ValueError(f"Missing stage prompts: {sorted(missing)}")
         self.fewshot = {}

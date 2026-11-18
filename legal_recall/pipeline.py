@@ -1,55 +1,60 @@
-"""P1–P6 annotation with source isolation, validated evidence and resumable cases."""
+"""Court-citation anchored annotation: one rule-recall query per legal issue the court actually decided.
 
-from concurrent.futures import ThreadPoolExecutor
+Per case, code splits the judgment into facts / reasoning / decision, extracts the court's citations and resolves
+each to an article unit (instrument name or number, cited year or judgment date -> version). The ISSUE call groups
+the substantive citations into issues and writes a facts-only research question; the EVIDENCE call confirms each
+cited article for its issue and picks the supporting clauses. Code then builds qrels, requirement groups (with
+equivalent copies and cross-version alternatives) and evidence offsets, and grades the query silver or needs_review.
+"""
+
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 import json
 import logging
 import re
 
-from .client import BudgetError, ChatClient, ModelError, image_part
+from .citations import ActIndex, fold_char_string, judgment_date, mentions, role, sections, stream
+from .client import ChatClient, LangfuseTracer, ModelError, image_part
 from .config import canonical, digest, file_hash
 from .contracts import PromptBank, schema
 from .store import write_jsonl
-from .text import document_number, leakage, quote_spans, sentences, sha, window_text, timeline_mentions
+from .text import document_number, leakage, sentences, timeline_mentions
 
 
 LOG = logging.getLogger(__name__)
 
 
 class AnnotationError(ValueError):
-    pass
+    code = "annotation_validation"
 
 
-def validate_stage_output(stage, payload, output):
-    if stage == "P1":
-        expected = {s["id"] for s in payload["sentences"]}
-        returned = [r["sentence_id"] for r in output["sentence_roles"]]
-        if set(returned) != expected or len(returned) != len(expected) or not set(output["usable_fact_ids"]) <= expected:
-            raise AnnotationError("P1 sentence coverage/IDs invalid")
-    elif stage == "P2":
-        allowed = {s["id"] for s in payload["facts"]}
-        ids = [i["issue_id"] for i in output["issues"]]
-        if len(ids) != len(set(ids)):
-            raise AnnotationError("Duplicate issue IDs")
-        for i in output["issues"]:
-            if not i["fact_support_ids"] or not set(i["fact_support_ids"]) <= allowed or not i["issue_text"].strip() or not i["query_text"].strip() or leakage(i["issue_text"] + " " + i["query_text"]):
-                raise AnnotationError("P2 grounding/leakage checks failed")
-    elif stage == "P3":
-        allowed = {u["candidate_id"] for u in payload["candidates"]}
-        if not set(output["selected_candidate_ids"]) <= allowed or not set(output["support_sentence_ids"]) <= {s["id"] for s in payload["context"]}:
-            raise AnnotationError("P3 source/context IDs invalid")
-    elif stage == "P4":
-        if output["candidate_id"] != payload["source"]["candidate_id"]:
-            raise AnnotationError("P4 source ID invalid")
-    elif stage == "P5":
-        allowed = {s["source"]["candidate_id"] for s in payload["sources"]}
-        ids = [g["group_id"] for g in output["proposed_requirement_groups"]]
-        if len(ids) != len(set(ids)) or any(not g["candidate_ids"] or not set(g["candidate_ids"]) <= allowed for g in output["proposed_requirement_groups"]):
-            raise AnnotationError("P5 group IDs invalid")
-    elif stage == "P6":
-        allowed = {s["source"]["candidate_id"] for s in payload["source_evidence"]}
-        if any(item["candidate_id"] not in allowed for item in output["independent_relevance"]):
-            raise AnnotationError("P6 source IDs invalid")
+class Skip(Exception):
+    """A case that cannot yield a query by construction (no facts section, no resolvable substantive citation)."""
+
+    def __init__(self, reason, stats=None):
+        super().__init__(reason)
+        self.reason, self.stats = reason, stats or {}
+
+
+# Model-quality failures of one call. In ISSUE they fail the case; in EVIDENCE they degrade one source to a
+# fallback with low confidence. Every other client error (transport, HTTP, tokenize, protocol, refusal) is an
+# infrastructure/configuration problem: the run stops and untouched cases are picked up by the next run.
+SOFT_MODEL_ERRORS = {"context_budget", "incomplete", "schema", "semantic_validation"}
+
+# Research questions must not name the instrument either ("Bộ luật dân sự", "Luật Đất đai", "BLHS").
+INSTRUMENT_RE = re.compile(r"(?i)\b(?:bộ\s+luật|nghị\s+quyết|nghị\s+định|thông\s+tư|pháp\s+lệnh|hiến\s+pháp|blds|blhs|blttds|blttths|blld)\b"
+                           r"|(?<!pháp )\bluật\b")
+REPAIR_NOTES = ("Lần trả lời trước bị loại vì issue_text/query_text lộ đáp án. Viết lại: không ghi số Điều, khoản, điểm, "
+                "số hiệu hay tên văn bản (kể cả 'Bộ luật ...', 'Luật ...', 'Nghị quyết ...'); không nêu kết quả hay nhận "
+                "định của Tòa; câu hỏi chỉ dựa trên facts được cung cấp.")
+CONFIDENCE = {"high": 2, "medium": 1, "low": 0}
+METHOD_CONFIDENCE = {"instrument_number": "high", "name_and_year": "high", "year_from_same_judgment": "medium", "in_force_on_judgment_date": "medium",
+                     "only_act_with_name": "medium", "instrument_number_loose": "medium", "instrument_number_phapdien": "medium"}
+
+
+def leaks(text):
+    return bool(leakage(text) or INSTRUMENT_RE.search(text))
 
 
 def unit_payload(unit, include_text=True):
@@ -66,34 +71,98 @@ def unit_payload(unit, include_text=True):
     return result
 
 
+def trimmed(text, start, end):
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return start, end
+
+
+def clause_options(unit, clauses, cid):
+    """Selectable evidence spans of an article, as offsets into unit.text: its clauses, or the article body."""
+    text, options = unit["text"], []
+    for clause in clauses:
+        start, end = trimmed(text, clause["start"] - unit["start"], clause["end"] - unit["start"])
+        if start < end:
+            options.append({"id": f"{cid}.k{clause['clause']}", "clause": clause["clause"], "start": start, "end": end})
+    if not options:
+        start, end = trimmed(text, body_start(unit), len(text))
+        if start >= end:
+            start, end = trimmed(text, 0, len(text))
+        options.append({"id": f"{cid}.all", "clause": None, "start": start, "end": end})
+    return options
+
+
+def body_start(unit):
+    """Offset after the article heading ("Điều\n463. Hợp đồng vay tài sản"), and after the title line when the
+    title sits on its own line ("Điều 194.\nTội ..."); Pháp điển copies carry the body only."""
+    text = unit["text"]
+    m = re.match(r"\s*(?:\*\*|#{1,6}\s*)?Điều\s*\d+[a-zđ]?\s*[.:]?[ \t]*([^\n]*)\n?", text, re.I)
+    if not m:
+        return 0
+    if m.group(1).strip():
+        return m.end()
+    title = re.match(r"[ \t]*[^\n]*\n?", text[m.end():])
+    return m.end() + title.end() if text[m.end():].strip() else m.end()
+
+
+def locate(haystack, needle):
+    """Span of needle in haystack ignoring whitespace, case and diacritics (copies differ in line breaks)."""
+    hay, hay_index = stream(haystack)
+    pin = stream(needle)[0]
+    pos = hay.find(pin) if pin else -1
+    return {"start": hay_index[pos], "end": hay_index[pos + len(pin) - 1] + 1} if pos >= 0 else None
+
+
+def article_title(unit):
+    """Article heading, or its first body line when the heading sits on its own line ("Điều 194.\nTội ...")."""
+    if unit["title"].strip():
+        return unit["title"].strip()
+    lines = [l.strip() for l in unit["text"].split("\n")[1:] if l.strip()]
+    return lines[0][:160] if lines else ""
+
+
+def same_text(a, b):
+    return stream(a["text"])[0] == stream(b["text"])[0]
+
+
 class Pipeline:
     def __init__(self, config, store):
         self.config = config
         self.store = store
         self.prompts = PromptBank(config.prompts_file, config.fewshot_file)
-        self.clients = {name: ChatClient(p, config.output_dir / "cache", config.output_dir / "logs" / "model_calls.jsonl")
+        self.tracer = (LangfuseTracer(config.langfuse_host, config.langfuse_public_key, config.langfuse_secret_key,
+                                      config.langfuse_capture_io) if config.langfuse_host else None)
+        self.clients = {name: ChatClient(p, config.output_dir / "cache", config.output_dir / "logs" / "model_calls.jsonl", self.tracer)
                         for name, p in config.profiles.items()}
         self.snapshot = store.snapshot()
         self.code_fingerprint = digest({p.name: file_hash(p) for p in sorted(Path(__file__).parent.glob("*.py"))})
         self.run_hash = digest({"snapshot": self.snapshot, "prompts": self.prompts.version,
-                               "code": self.code_fingerprint,
-                               "profiles": {k: v.public() for k, v in config.profiles.items()},
-                               "bindings": config.stage_profiles,
-                               "policy": {k: getattr(config, k) for k in ["pool_size", "link_candidates", "max_issues", "max_citations", "max_source_windows", "max_expansion_rounds", "verifier_enabled", "sentence_chunk_size"]}})
+                                "code": self.code_fingerprint,
+                                "profiles": {k: v.public() for k, v in config.profiles.items()},
+                                "bindings": config.stage_profiles,
+                                "policy": {k: getattr(config, k) for k in ["max_issues", "stage_max_output_tokens"]}})
+        self._acts = None
+
+    @property
+    def acts(self):
+        if self._acts is None:
+            self._acts = ActIndex(self.store.connection.execute("SELECT * FROM acts"))
+        return self._acts
 
     def client(self, stage):
         return self.clients[self.config.profile(stage).name]
 
-    def call(self, stage, payload, output_schema, item_id):
+    def call(self, stage, payload, output_schema, item_id, case_id, validator=None):
         client = self.client(stage)
         messages = self.prompts.messages(stage, payload, output_schema, client.profile)
+        trace = {"trace_key": f"{self.run_hash}:{case_id}", "trace_name": f"case {case_id}", "case_id": case_id,
+                 "item_id": str(item_id), "session_id": self.run_hash}
         return client.complete(stage, messages, output_schema,
                                {"run_hash": self.run_hash, "prompt_version": self.prompts.version, "item_id": item_id},
-                               semantic_validator=lambda output: validate_stage_output(stage, payload, output))
-
-    def fits(self, stage, payload, output_schema):
-        client = self.client(stage)
-        return client.fits(self.prompts.messages(stage, payload, output_schema, client.profile), output_schema)
+                               semantic_validator=validator, trace=trace,
+                               max_output_tokens=self.config.stage_max_output_tokens.get(stage))
 
     def preflight(self, include_vision=False):
         results = []
@@ -106,7 +175,9 @@ class Pipeline:
             output_schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": False}
             messages = [{"role": client.profile.instruction_role, "content": "Return JSON {\"ok\": true}."},
                         {"role": "user", "content": "Synthetic connection test. No legal case data."}]
-            output = client.complete("preflight", messages, output_schema, {"purpose": "synthetic_preflight"})
+            output = client.complete("preflight", messages, output_schema, {"purpose": "synthetic_preflight"},
+                                     trace={"trace_key": f"preflight:{name}:{self.run_hash}", "trace_name": f"preflight {name}",
+                                            "session_id": self.run_hash})
             if output != {"ok": True}:
                 raise AnnotationError("Preflight returned unexpected content")
             results.append({"profile": name, "mode": client.profile.output_mode, "passed": True})
@@ -117,255 +188,458 @@ class Pipeline:
             results.append({"profile": self.config.stage_profiles["P0V"], "vision": "requires vision command with a local test image"})
         return results
 
-    def extract(self, case):
-        indexed = sentences(case["text"])
-        if not indexed:
-            raise AnnotationError("No usable text sentences")
-        role_map, fact_ids, notes = {}, set(), []
-        chunks = []
-        current = []
-        for sentence in indexed:
-            trial = current + [sentence]
-            payload = {"sentences": trial, "target_instance": case["metadata"].get("instance_level"), "target_time": "before_target_court_decision"}
-            contract = schema("P1", sentence_ids=[s["id"] for s in trial])
-            if current and (len(trial) > self.config.sentence_chunk_size or not self.fits("P1", payload, contract)):
-                chunks.append(current)
-                overlap = [current[-1], sentence]
-                overlap_payload = {"sentences": overlap, "target_instance": case["metadata"].get("instance_level"), "target_time": "before_target_court_decision"}
-                if self.fits("P1", overlap_payload, schema("P1", sentence_ids=[s["id"] for s in overlap])):
-                    current = overlap
-                else:
-                    current = [sentence]
-                    notes.append("chunk_boundary_context_did_not_fit")
-            else:
-                current = trial
-        if current:
-            chunks.append(current)
-        for i, chunk in enumerate(chunks):
-            ids = {s["id"] for s in chunk}
-            result = self.call("P1", {"sentences": chunk, "target_instance": case["metadata"].get("instance_level"),
-                               "target_time": "before_target_court_decision"}, schema("P1", sentence_ids=sorted(ids)), f"{case['id']}:chunk:{i}")
-            returned = [r["sentence_id"] for r in result["sentence_roles"]]
-            if set(returned) != ids or len(returned) != len(ids) or not set(result["usable_fact_ids"]) <= ids:
-                raise AnnotationError("P1 must classify each input sentence exactly once and use only supplied IDs")
-            for r in result["sentence_roles"]:
-                if r["sentence_id"] in role_map and role_map[r["sentence_id"]]["role"] != r["role"]:
-                    notes.append("overlap_role_disagreement:" + r["sentence_id"])
-                role_map[r["sentence_id"]] = r
-            fact_ids.update(result["usable_fact_ids"])
-            notes.extend(result["context_needed"] + result["uncertainties"])
-        allowed_roles = {"facts_reported", "party_request", "procedural_history", "party_argument"}
-        facts, removed = [], []
-        for sentence in indexed:
-            if sentence["id"] not in fact_ids:
-                continue
-            if (sentence["forbidden_section"] or sentence["explicit_legal_or_outcome"]
-                    or role_map[sentence["id"]]["role"] not in allowed_roles):
-                removed.append(sentence["id"])
-            else:
-                facts.append({**sentence, "attribution": role_map[sentence["id"]]})
+    # ---- deterministic preparation (main thread: all database reads happen here) ----
+
+    def resolve(self, mention, on_date, document_years=None):
+        ref, article = mention["act_ref"], mention["article"]
+        if not ref:
+            return {"status": "no_instrument"}
+        if ref.get("unparsed"):
+            return {"status": "unrecognized_instrument", "doc_type": ref["doc_type"]}
+        if ref.get("number_key"):
+            acts, method = self.acts.by_number(ref["number_key"], ref["doc_type"])
+            acts = [a for a in acts if a["doc_type"] == ref["doc_type"]] or acts
+            if not acts:
+                copies = self.store.number_units(ref["number"], article, "phapdien")
+                if copies:
+                    return {"status": "resolved", "unit_id": copies[0]["id"], "act_id": copies[0]["source_id"], "number": ref["number"],
+                            "doc_type": ref["doc_type"], "name_key": None, "method": "instrument_number_phapdien", "flags": []}
+                return {"status": "act_not_in_corpus", "number": ref["number"]}
+            act, flags = acts[0], ([] if len(acts) == 1 else ["several_acts_same_number"])
+            number = ref["number"]  # the clean cited number also finds Pháp điển copies
+        else:
+            year, inferred = ref.get("year"), []
+            if not year:
+                # A bare "Bộ luật hình sự" means the version this judgment names elsewhere, when it names exactly one.
+                years = (document_years or {}).get((ref["doc_type"], ref["name_key"]), set())
+                if len(years) == 1:
+                    year, inferred = next(iter(years)), ["year_from_same_judgment"]
+                elif len(years) > 1:
+                    inferred = ["several_versions_cited_in_judgment"]
+            act, method, flags = self.acts.pick(ref["doc_type"], ref["name_key"], year, on_date)
+            if not act:
+                return {"status": method, "flags": flags + inferred}
+            if inferred == ["year_from_same_judgment"] and method == "name_and_year":
+                method, inferred = "year_from_same_judgment", []
+            flags = flags + inferred
+            if ref.get("name_prefix_match"):
+                flags = flags + ["instrument_name_misspelt"]
+            number = act["number"]
+        units = self.store.article_units(act["id"], article)
+        if not units:
+            return {"status": "article_not_found", "act_id": act["id"], "number": number, "method": method, "flags": flags}
+        unit = next((u for u in units if "possible_embedded_or_amending_unit" not in u["flags"]), units[0])
+        if len(units) > 1:
+            flags = flags + ["repeated_article_in_act"]
+        return {"status": "resolved", "unit_id": unit["id"], "act_id": act["id"], "number": number, "doc_type": act["doc_type"],
+                "name_key": act["name_key"], "method": method, "flags": flags}
+
+    def prepare(self, case):
+        text = case["text"]
+        spans = sections(text)
+        if "facts" not in spans:
+            raise Skip("no_facts_section")
+        if not {"reasoning", "decision"} & spans.keys():
+            raise Skip("no_reasoning_or_decision_section")
+        all_sentences = sentences(text)
+        fact_start, fact_end = spans["facts"]
+        facts = [s for s in all_sentences if fact_start <= s["start"] and s["end"] <= fact_end and not s["explicit_legal_or_outcome"]]
         if not facts:
-            raise AnnotationError("No facts survived source-role and leakage validation")
-        return {"facts": facts, "sentence_roles": role_map, "uncertainties": notes,
-                "removed_unsafe_fact_ids": removed, "all_sentences": indexed}
+            raise Skip("no_usable_facts")
+        on_date = judgment_date(text, case["metadata"])
+        found = mentions(text, [(n, *spans[n]) for n in ("reasoning", "decision") if n in spans], self.acts)
+        document_years = {}
+        for m in found:
+            ref = m["act_ref"] or {}
+            if ref.get("name_key") and ref.get("year"):
+                document_years.setdefault((ref["doc_type"], ref["name_key"]), set()).add(ref["year"])
+        stats, cache, records, targets = Counter(), {}, [], {}
+        for m in found:
+            key = canonical([m["act_ref"], m["article"]])
+            if key not in cache:
+                cache[key] = self.resolve(m, on_date, document_years)
+            resolution = cache[key]
+            sentence = next((s for s in all_sentences if s["start"] <= m["start"] < s["end"]), None)
+            kind = role(m, resolution if resolution["status"] == "resolved" else None, sentence["text"] if sentence else m["raw"])
+            records.append({**{k: m[k] for k in ["article", "clauses", "act_ref", "binding", "section", "start", "end", "raw"]},
+                            "sentence_id": sentence["id"] if sentence else None, "role": kind, "resolution": resolution})
+            stats["mentions"] += 1
+            stats[f"role:{kind}"] += 1
+            stats[f"resolution:{resolution['status']}"] += 1
+            if kind == "substantive" and resolution["status"] == "resolved":
+                target = targets.setdefault(resolution["unit_id"], {"resolution": resolution, "mention_indexes": [], "cited_clauses": set(), "sentence_ids": set()})
+                target["mention_indexes"].append(len(records) - 1)
+                target["cited_clauses"].update(m["clauses"])
+                if sentence:
+                    target["sentence_ids"].add(sentence["id"])
+        unresolved = sorted({r["raw"] for r in records if r["role"] == "substantive" and r["resolution"]["status"] != "resolved"})
+        stats["substantive_targets"] = len(targets)
+        if not targets:
+            raise Skip("no_resolved_substantive_citation", dict(stats))
+        prepared = {}
+        for i, (uid, target) in enumerate(targets.items(), 1):
+            cid = f"c{i}"
+            unit = self.store.get_unit(uid)
+            options = clause_options(unit, self.store.clauses(unit), cid)
+            unit["title"] = article_title(unit)
+            number = target["resolution"]["number"]
+            equivalents = []
+            if number:
+                equivalents = [u for u in self.store.number_units(number, unit["article"], "phapdien") if u["id"] != uid]
+                equivalents += [u for u in self.store.number_units(number, unit["article"], "tvpl") if u["id"] != uid and same_text(u, unit)]
+            prepared[cid] = {"cid": cid, "unit": unit, "options": options,
+                             "equivalents": equivalents, "cited_clauses": sorted(target["cited_clauses"]),
+                             "sentence_ids": sorted(target["sentence_ids"], key=lambda s: int(s[1:])),
+                             "resolution": target["resolution"], "mention_indexes": target["mention_indexes"]}
+        by_sentence = {}
+        for cid, target in prepared.items():
+            for sid in target["sentence_ids"]:
+                by_sentence.setdefault(sid, []).append(cid)
+        excerpts = [{"id": s["id"], "text": s["text"], "citation_ids": by_sentence[s["id"]]} for s in all_sentences if s["id"] in by_sentence]
+        return {"case": case, "spans": spans, "facts": facts, "judgment_date": on_date, "citations": records,
+                "targets": prepared, "excerpts": excerpts, "unresolved_substantive": unresolved, "stats": dict(stats)}
 
-    def generate_queries(self, case, extraction):
-        # Deliberately excludes judgment IDs/URLs, citations, reasoning and outcome.
-        facts = [{"id": s["id"], "text": s["text"], "attribution": s["attribution"]} for s in extraction["facts"]]
-        output = self.call("P2", {"facts": facts, "task": "find_legal_sources_for_one_issue",
-                           "target_time": "before_target_court_decision"},
-                           schema("P2", sentence_ids=[s["id"] for s in facts], max_issues=self.config.max_issues), case["id"])
-        allowed = {s["id"] for s in facts}
-        seen = set()
-        for item in output["issues"]:
-            if item["issue_id"] in seen:
-                raise AnnotationError("P2 repeated an issue ID")
-            seen.add(item["issue_id"])
-            if not item["fact_support_ids"] or not set(item["fact_support_ids"]) <= allowed:
-                raise AnnotationError("P2 issue has no valid fact evidence")
+    # ---- model calls (worker threads: no database access) ----
+
+    def issue_payload(self, ctx, revision=False):
+        payload = {"task": "group_court_citations_into_issues_and_write_facts_only_questions",
+                   "facts": [{"id": s["id"], "text": s["text"]} for s in ctx["facts"]],
+                   "court_reasoning": ctx["excerpts"],
+                   "citations": [{"id": cid, "article": t["unit"]["article"], "article_title": t["unit"]["title"],
+                                  "instrument": t["unit"]["source_title"], "instrument_number": t["resolution"]["number"],
+                                  "court_cited_clauses": t["cited_clauses"]} for cid, t in ctx["targets"].items()],
+                   "max_issues": self.config.max_issues}
+        if revision:
+            payload["revision_notes"] = REPAIR_NOTES
+        return payload
+
+    def issues(self, ctx):
+        case_id = ctx["case"]["id"]
+        contract = schema("ISSUE", [s["id"] for s in ctx["facts"]], list(ctx["targets"]), max_issues=self.config.max_issues)
+
+        def problem(item):
             if not item["issue_text"].strip() or not item["query_text"].strip():
-                raise AnnotationError("P2 produced an empty issue/query")
-            if leakage(item["issue_text"] + " " + item["query_text"]):
-                raise AnnotationError("P2 output contains an explicit statute citation or court-outcome signal")
-        return output["issues"]
+                return "empty_text"
+            return "leakage" if leaks(item["issue_text"] + " " + item["query_text"]) else None
 
-    def resolve_citations(self, case, indexed):
-        raw = case["citations"]
-        citations = []
-        for c in raw.get("regex", []):
-            citations.append({"raw": c.get("ref") or "", "article": c.get("article"),
-                              "law_name": c.get("law_name"), "number": document_number(c.get("id")), "spans": c.get("span") or []})
-        for c in raw.get("structural", []):
-            citations.append({"raw": c.get("raw") or "", "article": c.get("dieu"), "law_name": c.get("target"),
-                              "number": document_number(c.get("target")), "spans": []})
-        distinct = {}
-        for c in citations:
-            key = canonical([c["article"], c["law_name"], c["number"]])
-            if key not in distinct:
-                distinct[key] = c
-        resolved, all_candidates = [], {}
-        for index, c in enumerate(list(distinct.values())[:self.config.max_citations]):
-            article = str(c["article"]).lower().lstrip("0") if c["article"] else None
-            candidates = self.store.search(c["raw"] + " " + (c["law_name"] or ""), self.config.link_candidates,
-                                           number=c["number"], article=article)
-            if not candidates and c["number"]:
-                candidates = self.store.search(c["raw"] + " " + (c["law_name"] or ""), self.config.link_candidates, article=article)
-            for unit in candidates:
-                all_candidates[unit["id"]] = unit
-            if not candidates:
-                resolved.append({"citation": c, "resolution_status": "not_found_in_candidates", "selected_candidate_ids": []})
-                continue
-            exact = [u for u in candidates if c["number"] and u["number"] == c["number"] and u["article"] == article]
-            if len(exact) == 1:
-                resolved.append({"citation": c, "resolution_status": "candidate_resolved", "selected_candidate_ids": [exact[0]["id"]],
-                                 "method": "unique_number_and_article_unverified_version"})
-                continue
-            context_ids = set()
-            for span in c["spans"]:
-                if len(span) == 2 and isinstance(span[0], int) and isinstance(span[1], int):
-                    context_ids.update(s["id"] for s in indexed if s["start"] < span[1] + 200 and s["end"] > span[0] - 200)
-            if not context_ids and c["raw"]:
-                # Locate rather than invent offsets for structural-parser citations.
-                context_ids.update(s["id"] for s in indexed if c["raw"] in s["text"])
-            context = [s for s in indexed if s["id"] in context_ids]
-            payload = {"citation": c, "context": context,
-                       "candidates": [{**unit_payload(u, False), "text_excerpt": u["text"][:1000],
-                                       "excerpt_is_partial": len(u["text"]) > 1000} for u in candidates]}
-            contract = schema("P3", sentence_ids=sorted(context_ids), candidate_ids=[u["id"] for u in candidates])
+        def usable(output):
+            # Raising here keeps a response with no usable issue out of the cache, so a retry really asks again.
+            ids = [i["issue_id"] for i in output["issues"]]
+            if len(ids) != len(set(ids)):
+                raise ValueError("duplicate issue id")
+            if not any(problem(i) is None for i in output["issues"]):
+                raise ValueError("no usable issue")
+
+        for attempt in range(2):
             try:
-                result = self.call("P3", payload, contract, f"{case['id']}:citation:{index}")
-                if not set(result["selected_candidate_ids"]) <= {u["id"] for u in candidates}:
-                    raise AnnotationError("P3 selected a candidate outside its input")
-                if not set(result["support_sentence_ids"]) <= context_ids:
-                    raise AnnotationError("P3 cited unknown context sentences")
-                resolved.append({"citation": c, **result, "method": "llm_candidate_link"})
-            except BudgetError:
-                resolved.append({"citation": c, "resolution_status": "ambiguous_version", "selected_candidate_ids": [], "reason": "context_budget"})
-        return resolved, all_candidates, len(distinct) > self.config.max_citations
+                output = self.call("ISSUE", self.issue_payload(ctx, attempt > 0), contract, case_id + (":repair" if attempt else ""), case_id, usable)
+            except ModelError as error:
+                if error.code != "semantic_validation":
+                    raise
+                if attempt:
+                    failure = AnnotationError("ISSUE produced no usable issue (empty text or leakage of law/outcome) after one repair")
+                    failure.code = "no_valid_issue"
+                    raise failure from None
+                continue
+            dropped = [f"{i['issue_id']}:{problem(i)}" for i in output["issues"] if problem(i)]
+            return output, [i for i in output["issues"] if problem(i) is None], dropped, attempt > 0
 
-    def assess(self, query, unit):
-        # Chunk long sources without silently treating an unread suffix as irrelevant.
-        budget = max(128, self.client("P4").profile.max_input_chars // 4)
-        windows = list(window_text(unit["text"], budget))
-        if self.config.max_source_windows and len(windows) > self.config.max_source_windows:
-            return {"candidate_id": unit["id"], "relevance_proposal": "uncertain", "version_status": "unresolved",
-                    "evidence": [], "source_roles": [], "short_justification": "Source window limit exceeded; full source not assessed",
-                    "flags": ["incomplete_source_read"], "window_assessments": []}
-        outputs, evidence, flags = [], [], []
-        for index, window in enumerate(windows):
-            payload = {"query": query["model_input"], "source": unit_payload(unit, False),
-                       "window": {**window, "window_index": index, "total_windows": len(windows)},
-                       "parent_context": "Source is an article or codified extract; supplied window may require other windows."}
-            result = self.call("P4", payload, schema("P4", candidate_ids=[unit["id"]]), f"{query['id']}:{unit['id']}:window:{index}")
-            outputs.append(result)
-            for quote in result["evidence_quotes"]:
-                matches = quote_spans(window["text"], quote)
-                if len(matches) != 1:
-                    flags.append("quote_not_found" if not matches else "quote_ambiguous")
-                    continue
-                span = matches[0]
-                evidence.append({"start": window["start"] + span["start"], "end": window["start"] + span["end"], "quote": quote})
-        order = {"core_candidate": 3, "supporting": 2, "uncertain": 1, "not_relevant": 0}
-        label = max((o["relevance_proposal"] for o in outputs), key=order.get)
-        if label in {"core_candidate", "supporting"} and not evidence:
-            flags.append("positive_without_valid_evidence")
-            label = "uncertain"
-        # All ingested version data are observations, not verified temporal assertions.
-        version = "unresolved"
-        if any(o["version_status"] == "contradicted" for o in outputs):
-            flags.append("proposed_version_conflict")
-        return {"candidate_id": unit["id"], "relevance_proposal": label, "version_status": version,
-                "evidence": list({(e["start"], e["end"]): e for e in evidence}.values()),
-                "source_roles": sorted({role for o in outputs for role in o["source_roles"]}),
-                "short_justification": " ".join(o["short_justification"] for o in outputs),
-                "flags": sorted(set(flags)), "window_assessments": outputs}
+    def evidence(self, ctx, issue):
+        """Assessment per citation id, or {"error": code} when the call failed softly (caller falls back)."""
+        case_id = ctx["case"]["id"]
+        facts = {s["id"]: s["text"] for s in ctx["facts"]}
 
-    def annotate_issue(self, case, issue, extraction, citation_results, citation_pool, citations_truncated):
-        qid = "rr:" + digest([case["id"], issue["issue_id"], self.run_hash])[:24]
-        facts = [{"sentence_id": s["id"], "text": s["text"], "speaker": s["attribution"]["speaker"],
-                  "dispute_status": s["attribution"]["dispute_status"]} for s in extraction["facts"]]
-        query = {"id": qid, "case_id": case["id"], "family_id": case["family_id"], "split": case["split"],
-                 "run_hash": self.run_hash, "query_origin": "judgment_facts", "quality": "candidate",
-                 "model_input": {"facts": facts, "issue": issue["issue_text"], "question": issue["query_text"],
-                                 "timeline": timeline_mentions(facts),
-                                 "fact_support_ids": issue["fact_support_ids"], "missing_facts": issue["missing_facts"],
-                                 "answerability_proposal": issue["query_status"], "corpus_snapshot_id": self.snapshot},
-                 "private_provenance": {"judgment_id": case["id"], "metadata": case["metadata"],
-                                        "text_hash": case["text_hash"], "family_flags": case["family_flags"],
-                                        "query_fact_spans": [{"sentence_id": s["id"], "start": s["start"], "end": s["end"]} for s in extraction["facts"]]},
-                 "annotation": {"citations": citation_results, "extraction_uncertainties": extraction["uncertainties"],
-                                "removed_unsafe_fact_ids": extraction["removed_unsafe_fact_ids"], "citations_truncated": citations_truncated}}
-        lexical = self.store.search(issue["query_text"] + " " + issue["issue_text"], self.config.pool_size)
-        selected = {cid for r in citation_results for cid in r.get("selected_candidate_ids", [])}
-        pool = {}
-        # Reserve half the pool for independently retrieved sources; do not let boilerplate exhaust it.
-        for u in lexical[:max(1, self.config.pool_size // 2)]:
-            pool[u["id"]] = u
-        for cid in sorted(selected):
-            if len(pool) >= self.config.pool_size:
-                break
-            if cid in citation_pool:
-                pool[cid] = citation_pool[cid]
-        for u in lexical:
-            if len(pool) >= self.config.pool_size:
-                break
-            pool[u["id"]] = u
-        assessments = {}
-        set_review = {"proposed_requirement_groups": [], "redundant_sources": [], "unresolved_version_conflicts": [],
-                      "missing_source_requests": [], "review_reasons": ["empty_pool"]}
-        for expansion_round in range(self.config.max_expansion_rounds + 1):
-            todo = [u for uid, u in sorted(pool.items()) if uid not in assessments]
-            workers = self.client("P4").profile.concurrency
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                for item in executor.map(lambda u: self.assess(query, u), todo):
-                    assessments[item["candidate_id"]] = item
-            if not assessments:
-                break
-            summaries = [{"source": unit_payload(pool[uid], False), "assessment": {
-                k: a[k] for k in ["relevance_proposal", "version_status", "evidence", "flags"]}} for uid, a in sorted(assessments.items())]
+        def run(cids, item):
+            options = [o["id"] for cid in cids for o in ctx["targets"][cid]["options"]]
+            payload = {"issue": issue["issue_text"], "question": issue["query_text"],
+                       "facts": [facts[i] for i in issue["fact_ids"]],
+                       "sources": [{"id": cid, "article": ctx["targets"][cid]["unit"]["article"], "article_title": ctx["targets"][cid]["unit"]["title"],
+                                    "instrument": ctx["targets"][cid]["unit"]["source_title"], "court_cited_clauses": ctx["targets"][cid]["cited_clauses"],
+                                    "clauses": [{"id": o["id"], "text": " ".join(ctx["targets"][cid]["unit"]["text"][o["start"]:o["end"]].split())}
+                                                for o in ctx["targets"][cid]["options"]]} for cid in cids]}
+
+            def complete_and_consistent(output):
+                seen = [a["source_id"] for a in output["assessments"]]
+                if sorted(seen) != sorted(cids):
+                    raise ValueError("every source must be assessed exactly once")
+                for a in output["assessments"]:
+                    if any(not c.startswith(a["source_id"] + ".") for c in a["clause_ids"]):
+                        raise ValueError("clause belongs to another source")
+
+            output = self.call("EVIDENCE", payload, schema("EVIDENCE", citation_ids=cids, clause_ids=options), item, case_id, complete_and_consistent)
+            return {a["source_id"]: a for a in output["assessments"]}
+
+        cids = sorted(set(issue["citation_ids"]), key=lambda c: int(c[1:]))
+        try:
+            return run(cids, f"{case_id}:{issue['issue_id']}")
+        except ModelError as error:
+            if error.code not in SOFT_MODEL_ERRORS:
+                raise
+            if error.code != "context_budget" or len(cids) == 1:
+                return {cid: {"error": error.code} for cid in cids}
+        result = {}
+        for cid in cids:  # Too long together: assess each article on its own.
             try:
-                set_review = self.call("P5", {"query": query["model_input"], "sources": summaries,
-                                       "scope": "assessed_pool_only"}, schema("P5", candidate_ids=list(pool)), f"{qid}:set:{expansion_round}")
-            except BudgetError:
-                set_review = {"proposed_requirement_groups": [], "redundant_sources": [], "unresolved_version_conflicts": [],
-                              "missing_source_requests": [], "review_reasons": ["set_review_exceeds_context_budget"]}
-            for group in set_review["proposed_requirement_groups"]:
-                if not group["candidate_ids"] or not set(group["candidate_ids"]) <= pool.keys():
-                    raise AnnotationError("P5 requirement group references invalid candidates")
-            if expansion_round == self.config.max_expansion_rounds:
-                break
-            extra = []
-            for request in set_review["missing_source_requests"][:3]:
-                extra.extend(self.store.search(request, max(1, self.config.pool_size // 4)))
-            for a in assessments.values():
-                if a["relevance_proposal"] not in {"core_candidate", "supporting"}:
+                result.update(run([cid], f"{case_id}:{issue['issue_id']}:{cid}"))
+            except ModelError as error:
+                if error.code not in SOFT_MODEL_ERRORS:
+                    raise
+                result[cid] = {"error": error.code}
+        return result
+
+    def run_model(self, ctx):
+        output, kept, dropped, repaired = self.issues(ctx)
+        return {"issue_output": output, "issues": kept, "dropped_issues": dropped, "repaired": repaired,
+                "evidence": {issue["issue_id"]: self.evidence(ctx, issue) for issue in kept}}
+
+    # ---- dataset records (pure) ----
+
+    def build(self, ctx, model):
+        case, queries, seen = ctx["case"], [], set()
+        case_reasons = [f"issue_dropped:{d}" for d in model["dropped_issues"]] + (["issue_repair_attempted"] if model["repaired"] else [])
+        if ctx["unresolved_substantive"]:
+            case_reasons.append("unresolved_substantive_citations_in_case")
+        order = {s["id"]: i for i, s in enumerate(ctx["facts"])}
+        for issue in model["issues"]:
+            assessments = model["evidence"][issue["issue_id"]]
+            positives, reasons = [], list(case_reasons)
+            for cid in sorted(set(issue["citation_ids"]), key=lambda c: int(c[1:])):
+                target, assessment = ctx["targets"][cid], assessments.get(cid, {"error": "missing"})
+                options = {o["id"]: o for o in target["options"]}
+                flags = list(target["resolution"].get("flags", []))
+                if "error" in assessment:
+                    grade, chosen = 2, [o for o in target["options"] if o["clause"] in target["cited_clauses"]]
+                    flags.append(f"evidence_model_error:{assessment['error']}")
+                elif assessment["relevance"] == "not_relevant":
+                    reasons.append(f"court_citation_rejected_by_model:{cid}")
                     continue
-                extra.extend(self.relations(a["candidate_id"], max(1, self.config.pool_size // 4)))
-            cap = self.config.pool_size * (expansion_round + 2)
-            for u in extra:
-                if len(pool) >= cap:
+                else:
+                    grade = 2 if assessment["relevance"] == "core" else 1
+                    chosen = [options[c] for c in assessment["clause_ids"] if c in options] or \
+                             [o for o in target["options"] if o["clause"] in target["cited_clauses"]]
+                if not chosen:
+                    chosen = [{"start": 0, "end": len(target["unit"]["text"])}] if len(target["options"]) > 1 else target["options"]
+                    flags.append("evidence_whole_article")
+                level = METHOD_CONFIDENCE.get(target["resolution"]["method"], "low")
+                if any(ctx["citations"][i]["binding"] == "context" for i in target["mention_indexes"]) and level == "high":
+                    level = "medium"
+                if flags:
+                    level = "low"
+                spans = [{"start": o["start"], "end": o["end"]} for o in chosen]
+                positives.append({"cid": cid, "target": target, "grade": grade, "spans": spans, "confidence": level, "flags": flags,
+                                  "assessment": assessment})
+            core = [p for p in positives if p["grade"] == 2]
+            asked = re.sub(r"\s+", " ", fold_char_string(issue["issue_text"] + " " + issue["query_text"]))
+            for p in positives:
+                title = re.sub(r"\s+", " ", fold_char_string(p["target"]["unit"]["title"])).strip(" .")
+                if len(title.split()) >= 4 and title in asked:
+                    reasons.append(f"question_repeats_article_title:{p['cid']}")
+            groups, qrels, evidence = [], {}, []
+            merged = {}
+            for p in core:
+                unit, res = p["target"]["unit"], p["target"]["resolution"]
+                key = (res.get("doc_type"), res.get("name_key"), fold_char_string(unit["title"]).strip()) if res.get("name_key") and unit["title"] else p["cid"]
+                merged.setdefault(key, []).append(p)
+            for p in positives:
+                canonical_unit = p["target"]["unit"]
+                qrels[canonical_unit["id"]] = {"unit_id": canonical_unit["id"], "grade": p["grade"], "evidence": p["spans"],
+                                               "label_source": "court_applied", "confidence": p["confidence"], "copy_of": None}
+                for copy in p["target"]["equivalents"]:
+                    mapped = [locate(copy["text"], canonical_unit["text"][s["start"]:s["end"]]) for s in p["spans"]]
+                    if all(mapped):
+                        qrels[copy["id"]] = {"unit_id": copy["id"], "grade": p["grade"], "evidence": mapped, "label_source": "court_applied",
+                                             "confidence": p["confidence"], "copy_of": canonical_unit["id"]}
+                    else:
+                        p["flags"].append(f"copy_text_differs:{copy['id']}")  # e.g. Pháp điển holds the amended text
+            for i, members in enumerate(merged.values(), 1):
+                ids = []
+                for p in members:
+                    ids.append(p["target"]["unit"]["id"])
+                    ids += [c["id"] for c in p["target"]["equivalents"] if c["id"] in qrels]
+                groups.append({"group_id": f"g{i}", "unit_ids": ids, "canonical_unit_ids": [p["target"]["unit"]["id"] for p in members],
+                               "cross_version": len(members) > 1})
+            for row in qrels.values():
+                evidence.append({"unit_id": row["unit_id"], "spans": row["evidence"]})
+            facts = sorted({f: True for f in issue["fact_ids"]}, key=order.get)
+            fact_rows = [{"sentence_id": s["id"], "text": s["text"]} for s in ctx["facts"] if s["id"] in set(facts)]
+            if not core:
+                reasons.append("no_core_source")
+            confidence = min((p["confidence"] for p in core), key=CONFIDENCE.get, default="low")
+            if ctx["unresolved_substantive"] and confidence == "high":
+                confidence = "medium"
+            quality = "silver" if core and fact_rows else "needs_review"
+            key_ids = sorted(p["target"]["unit"]["id"] for p in positives) or [issue["issue_id"]]
+            qid = "rr:" + digest([case["id"], key_ids])[:24]
+            if qid in seen:
+                qid = "rr:" + digest([case["id"], key_ids, issue["issue_id"]])[:24]
+            seen.add(qid)
+            timeline = timeline_mentions(fact_rows) + ([{"event": "judgment_date", "date": ctx["judgment_date"]}] if ctx["judgment_date"] else [])
+            queries.append({
+                "id": qid, "case_id": case["id"], "family_id": case["family_id"], "split": case["split"], "run_hash": self.run_hash,
+                "query_origin": "court_citation_anchored", "quality": quality, "confidence": confidence, "review_status": "unreviewed",
+                "model_input": {"facts": fact_rows, "issue": issue["issue_text"], "question": issue["query_text"],
+                                "timeline": timeline, "corpus_snapshot_id": self.snapshot},
+                "target": {"answerability": "answerable", "qrels": list(qrels.values()), "requirement_groups": groups, "evidence": evidence},
+                "annotation": {
+                    "sources": [{"citation_id": p["cid"], "unit_id": p["target"]["unit"]["id"], "article": p["target"]["unit"]["article"],
+                                 "article_title": p["target"]["unit"]["title"], "instrument": p["target"]["unit"]["source_title"],
+                                 "instrument_number": p["target"]["resolution"]["number"], "resolution": p["target"]["resolution"],
+                                 "court_mentions": [ctx["citations"][i]["raw"] for i in p["target"]["mention_indexes"]],
+                                 "court_cited_clauses": p["target"]["cited_clauses"], "equivalent_unit_ids": [c["id"] for c in p["target"]["equivalents"]],
+                                 "grade": p["grade"], "confidence": p["confidence"], "flags": p["flags"], "model_assessment": p["assessment"]}
+                                for p in positives],
+                    "issue_citation_ids": issue["citation_ids"], "review_reasons": reasons,
+                    "unresolved_substantive_citations": ctx["unresolved_substantive"], "case_citations": ctx["citations"]},
+                "private_provenance": {"judgment_id": case["id"], "metadata": case["metadata"], "text_hash": case["text_hash"],
+                                       "family_flags": case["family_flags"], "judgment_date": ctx["judgment_date"],
+                                       "sections": {k: list(v) for k, v in ctx["spans"].items()},
+                                       "query_fact_spans": [{"sentence_id": s["id"], "start": s["start"], "end": s["end"]}
+                                                            for s in ctx["facts"] if s["id"] in set(facts)]}})
+        return queries
+
+    # ---- orchestration ----
+
+    def selected_cases(self):
+        selected = 0
+        for row in self.store.connection.execute("SELECT * FROM cases ORDER BY id"):
+            case = dict(row)
+            case["metadata"] = json.loads(case["metadata"])
+            if self.config.categories and case["metadata"].get("category") not in self.config.categories:
+                continue
+            if self.config.case_ids and case["id"] not in self.config.case_ids:
+                continue
+            selected += 1
+            if self.config.annotation_limit and selected > self.config.annotation_limit:
+                return
+            case["family_flags"] = json.loads(case["family_flags"] or "[]")
+            yield case
+
+    def record(self, case_id, status, result, code=None):
+        with self.store.transaction():
+            if status == "failed":
+                self.store.failure("annotation", case_id, code, result.get("message", ""))
+            self.store.connection.execute("INSERT INTO annotations VALUES (?,?,?,?,?) ON CONFLICT(case_id,run_hash) DO UPDATE SET "
+                                          "status=excluded.status,result=excluded.result,error_code=excluded.error_code",
+                                          (case_id, self.run_hash, status, canonical(result), code))
+
+    def annotate(self, retry_failed=False):
+        if not self.store.get_meta("family_revision"):
+            raise AnnotationError("Run build-cases before annotate")
+        if not self.store.connection.execute("SELECT 1 FROM units LIMIT 1").fetchone():
+            raise AnnotationError("No law units available; run build-laws first")
+        if not self.store.connection.execute("SELECT 1 FROM acts LIMIT 1").fetchone():
+            raise AnnotationError("No instrument index; run build-laws to build it")
+        for cid in self.config.case_ids:
+            if not self.store.connection.execute("SELECT 1 FROM cases WHERE id=?", (cid,)).fetchone():
+                raise AnnotationError("Requested case ID was not ingested; check RR_CASE_IDS and ingestion limits")
+        with self.store.transaction():
+            self.store.set_meta("active_run", self.run_hash)
+            self.store.set_meta("active_snapshot", self.snapshot)
+            self.store.set_meta("run:" + self.run_hash, {"config": self.config.public(), "prompt_hash": self.prompts.version,
+                                                       "snapshot": self.snapshot, "code_fingerprint": self.code_fingerprint})
+        summary = Counter()
+        workers = max(self.client(s).profile.concurrency for s in ("ISSUE", "EVIDENCE"))
+        stop = None
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            pending = {}
+
+            def collect(done):
+                nonlocal stop
+                for future in done:
+                    ctx = pending.pop(future)
+                    case_id = ctx["case"]["id"]
+                    try:
+                        queries = self.build(ctx, future.result())
+                    except ModelError as error:
+                        if error.code not in SOFT_MODEL_ERRORS:
+                            stop = stop or error
+                            summary["interrupted"] += 1
+                            continue
+                        self.fail(case_id, error.code, str(error), ctx["stats"], summary)
+                        continue
+                    except AnnotationError as error:
+                        self.fail(case_id, error.code, str(error), ctx["stats"], summary)
+                        continue
+                    with self.store.transaction():
+                        self.store.connection.execute("DELETE FROM queries WHERE case_id=? AND run_hash=?", (case_id, self.run_hash))
+                        for query in queries:
+                            # Query IDs are stable across runs (case + sources), so reviews survive code/prompt changes.
+                            self.store.connection.execute("INSERT INTO queries VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                                                          "case_id=excluded.case_id,run_hash=excluded.run_hash,payload=excluded.payload",
+                                                          (query["id"], case_id, self.run_hash, canonical(query)))
+                    self.record(case_id, "complete", {"query_ids": [q["id"] for q in queries], "stats": ctx["stats"],
+                                                      "quality": dict(Counter(q["quality"] for q in queries))})
+                    summary["complete"] += 1
+                    summary["queries"] += len(queries)
+                    summary["silver_queries"] += sum(q["quality"] == "silver" for q in queries)
+                    LOG.info("Annotated case %s: %s queries (%s silver)", case_id, len(queries), sum(q["quality"] == "silver" for q in queries))
+
+            for case in self.selected_cases():
+                if stop:
                     break
-                pool[u["id"]] = u
-            if all(uid in assessments for uid in pool):
+                summary["selected"] += 1
+                prior = self.store.connection.execute("SELECT status FROM annotations WHERE case_id=? AND run_hash=?", (case["id"], self.run_hash)).fetchone()
+                if prior and (prior[0] in {"complete", "skipped"} or not retry_failed):
+                    summary["previously_done"] += 1
+                    continue
+                try:
+                    ctx = self.prepare(case)
+                except Skip as skip:
+                    self.record(case["id"], "skipped", {"stats": skip.stats}, skip.reason)
+                    summary["skipped"] += 1
+                    summary[f"skipped:{skip.reason}"] += 1
+                    continue
+                pending[executor.submit(self.run_model, ctx)] = ctx
+                if len(pending) >= 2 * workers:
+                    collect(wait(pending, return_when=FIRST_COMPLETED).done)
+            if stop:
+                for future in pending:
+                    future.cancel()
+            while pending:
+                collect(wait(pending, return_when=FIRST_COMPLETED).done)
+        if self.tracer:
+            self.tracer.flush()
+        if not summary["selected"]:
+            raise AnnotationError("No judgments match the configured selection")
+        if stop:
+            LOG.error("Run stopped by %s; rerun the same command to continue", stop.code)
+            raise stop
+        counts = dict(self.store.connection.execute("SELECT status,count(*) FROM annotations WHERE run_hash=? GROUP BY status", (self.run_hash,)).fetchall())
+        return {"run_hash": self.run_hash, **{k: v for k, v in summary.items()}, "failed": summary.get("failed", 0), "run_totals": counts}
+
+    def fail(self, case_id, code, message, stats, summary):
+        self.record(case_id, "failed", {"message": message, "stats": stats}, code)
+        summary["failed"] += 1
+        summary[f"failed:{code}"] += 1
+        LOG.warning("Case %s failed: %s", case_id, code)
+        if self.config.fail_fast:
+            raise AnnotationError(f"Case {case_id} failed: {code}")
+
+    def audit(self, limit=200):
+        """Deterministic part only (no model call): how many cases can yield queries and why the others cannot."""
+        totals, citation_totals, examples = Counter(), Counter(), {}
+        for n, case in enumerate(self.selected_cases()):
+            if n >= limit:
                 break
-        verification = None
-        if self.config.verifier_enabled and assessments:
-            # No previous labels/rationales: independent view first, comparison is deterministic.
-            verifier_sources = []
-            for uid, assessment in sorted(assessments.items()):
-                verifier_sources.append({"source": unit_payload(pool[uid], False),
-                                         "evidence_quotes": [e["quote"] for e in assessment["evidence"]]})
+            totals["cases"] += 1
             try:
-                verification = self.call("P6", {"query": query["model_input"], "source_evidence": verifier_sources,
-                                         "scope": "provided_evidence_only_full_sources_not_supplied"}, schema("P6", candidate_ids=list(pool)), qid)
-                verification["disagreements"] = [r["candidate_id"] for r in verification["independent_relevance"]
-                    if r["candidate_id"] not in assessments or assessments[r["candidate_id"]]["relevance_proposal"] != r["relevance_proposal"]]
-            except BudgetError:
-                verification = {"review_reasons": ["verification_exceeds_context_budget"], "checks": [], "disagreements": []}
-        query["annotation"].update({"assessments": list(assessments.values()), "set_review": set_review,
-                                    "verification": verification, "pool_ids": sorted(pool), "pool_exhaustive": False,
-                                    "review_required": True})
-        return query
+                ctx = self.prepare(case)
+            except Skip as skip:
+                totals[f"skipped:{skip.reason}"] += 1
+                citation_totals.update(skip.stats)
+                examples.setdefault(skip.reason, case["id"])
+                continue
+            totals["eligible"] += 1
+            citation_totals.update(ctx["stats"])
+            if ctx["unresolved_substantive"]:
+                totals["eligible_with_unresolved_substantive"] += 1
+        substantive = sum(v for k, v in citation_totals.items() if k == "role:substantive")
+        report = {"cases": dict(totals), "citations": dict(citation_totals), "example_case_per_skip_reason": examples,
+                  "eligible_rate": totals["eligible"] / totals["cases"] if totals["cases"] else 0,
+                  "resolution_rate": citation_totals["resolution:resolved"] / citation_totals["mentions"] if citation_totals["mentions"] else 0,
+                  "substantive_mentions": substantive}
+        (self.config.output_dir / "audit.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        return report
 
     def relations(self, uid, limit=10):
         unit = self.store.get_unit(uid)
@@ -385,68 +659,6 @@ class Pipeline:
             if len(result) >= limit:
                 break
         return list(result.values())[:limit]
-
-    def annotate(self, retry_failed=False):
-        if not self.store.get_meta("family_revision"):
-            raise AnnotationError("Run build-cases before annotate")
-        if not self.store.connection.execute("SELECT 1 FROM units LIMIT 1").fetchone():
-            raise AnnotationError("No law units available; run build-laws first")
-        for cid in self.config.case_ids:
-            if not self.store.connection.execute("SELECT 1 FROM cases WHERE id=?", (cid,)).fetchone():
-                raise AnnotationError("Requested case ID was not ingested; check RR_CASE_IDS and ingestion limits")
-        with self.store.transaction():
-            self.store.set_meta("active_run", self.run_hash)
-            self.store.set_meta("active_snapshot", self.snapshot)
-            self.store.set_meta("run:" + self.run_hash, {"config": self.config.public(), "prompt_hash": self.prompts.version,
-                                                       "snapshot": self.snapshot, "code_fingerprint": self.code_fingerprint})
-        done = self.store.connection.execute("SELECT count(*) FROM annotations WHERE run_hash=? AND status='complete'", (self.run_hash,)).fetchone()[0]
-        selected, attempted, failed = 0, 0, 0
-        cursor = self.store.connection.execute("SELECT * FROM cases ORDER BY id")
-        for row in cursor:
-            case = dict(row)
-            case["metadata"] = json.loads(case["metadata"])
-            if self.config.categories and case["metadata"].get("category") not in self.config.categories:
-                continue
-            if self.config.case_ids and case["id"] not in self.config.case_ids:
-                continue
-            selected += 1
-            if self.config.annotation_limit and selected > self.config.annotation_limit:
-                break
-            prior = self.store.connection.execute("SELECT status FROM annotations WHERE case_id=? AND run_hash=?", (case["id"], self.run_hash)).fetchone()
-            if prior and (prior[0] == "complete" or not retry_failed):
-                continue
-            case["family_flags"] = json.loads(case["family_flags"] or "[]")
-            case["citations"] = json.loads(case["citations"])
-            attempted += 1
-            try:
-                extraction = self.extract(case)
-                issues = self.generate_queries(case, extraction)
-                if not issues:
-                    raise AnnotationError("No issue queries proposed; human fact/issue review required")
-                links, candidates, truncated = self.resolve_citations(case, extraction["all_sentences"])
-                queries = [self.annotate_issue(case, issue, extraction, links, candidates, truncated) for issue in issues]
-                with self.store.transaction():
-                    self.store.connection.execute("DELETE FROM queries WHERE case_id=? AND run_hash=?", (case["id"], self.run_hash))
-                    for query in queries:
-                        self.store.connection.execute("INSERT INTO queries VALUES (?,?,?,?)", (query["id"], case["id"], self.run_hash, canonical(query)))
-                    self.store.connection.execute("INSERT INTO annotations VALUES (?,?,?,?,?) ON CONFLICT(case_id,run_hash) DO UPDATE SET status=excluded.status,result=excluded.result,error_code=NULL",
-                                                   (case["id"], self.run_hash, "complete", canonical({"query_ids": [q["id"] for q in queries]}), None))
-                LOG.info("Annotated case %s: %s issue queries", case["id"], len(queries))
-            except (ModelError, AnnotationError, ValueError) as error:
-                failed += 1
-                code = getattr(error, "code", "annotation_validation")
-                # Do not put arbitrary exception strings (possibly provider output) into persisted logs.
-                with self.store.transaction():
-                    self.store.failure("annotation", case["id"], code, "Case failed; inspect source and stage logs")
-                    self.store.connection.execute("INSERT INTO annotations VALUES (?,?,?,?,?) ON CONFLICT(case_id,run_hash) DO UPDATE SET status=excluded.status,error_code=excluded.error_code",
-                                                   (case["id"], self.run_hash, "failed", None, code))
-                LOG.warning("Case %s failed: %s", case["id"], code)
-                if self.config.fail_fast:
-                    raise
-        if not selected:
-            raise AnnotationError("No judgments match the configured selection")
-        return {"run_hash": self.run_hash, "previously_complete": done, "attempted": attempted, "failed": failed,
-                "complete": self.store.connection.execute("SELECT count(*) FROM annotations WHERE run_hash=? AND status='complete'", (self.run_hash,)).fetchone()[0]}
 
     def vision(self, manifest=None):
         manifest = manifest or self.config.vision_manifest

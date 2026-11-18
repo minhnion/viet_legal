@@ -51,20 +51,17 @@ def active_queries(store):
 
 
 def review_template(query):
-    proposals = query["annotation"]["assessments"]
-    positive = [a for a in proposals if a["relevance_proposal"] in {"core_candidate", "supporting"}]
+    positive = [q for q in query["target"]["qrels"] if q["grade"] > 0]
     return {"query_id": query["id"], "base_hash": query_hash(query), "reviewer_id": "", "decision": "unreviewed",
             "facts_checked": False, "query_checked": False, "family_checked": False, "coverage_checked": False,
-            "answerability": query["model_input"]["answerability_proposal"],
+            "answerability": query["target"]["answerability"],
             "facts_sentence_ids": [f["sentence_id"] for f in query["model_input"]["facts"]],
             "issue_text": query["model_input"]["issue"], "query_text": query["model_input"]["question"],
-            "qrels": [{"unit_id": a["candidate_id"], "grade": 2 if a["relevance_proposal"] == "core_candidate" else 1,
-                       "evidence": [{"start": e["start"], "end": e["end"]} for e in a["evidence"]]} for a in positive],
-            "requirement_groups": [{"group_id": g["group_id"], "unit_ids": g["candidate_ids"]}
-                                   for g in query["annotation"]["set_review"].get("proposed_requirement_groups", [])],
-            "version_confirmations": [{"unit_id": a["candidate_id"], "verified": False,
+            "qrels": [{"unit_id": q["unit_id"], "grade": q["grade"], "evidence": q["evidence"]} for q in positive],
+            "requirement_groups": [{"group_id": g["group_id"], "unit_ids": g["unit_ids"]} for g in query["target"]["requirement_groups"]],
+            "version_confirmations": [{"unit_id": q["unit_id"], "verified": False,
                                        "official_source_url": "", "version_key": "", "version_description": "",
-                                       "effective_from": None, "effective_until": None} for a in positive],
+                                       "effective_from": None, "effective_until": None} for q in positive],
             "resolves_review_hashes": [], "notes": ""}
 
 
@@ -82,14 +79,13 @@ def export_review(config, store):
     def bundles():
         for q in queries:
             case = store.connection.execute("SELECT text FROM cases WHERE id=?", (q["case_id"],)).fetchone()
-            units = [store.get_unit(uid) for uid in q["annotation"]["pool_ids"]]
+            units = [store.get_unit(r["unit_id"]) for r in q["target"]["qrels"]]
             yield {"query": q, "base_hash": query_hash(q), "judgment_text": case[0], "sources": units,
-                   "instructions": "Duplicate template for independent reviewers. Fill decisions/checks/evidence/official version sources; never import model proposals as approvals."}
+                   "instructions": "Check facts, question, sources, versions and evidence against the judgment; search the corpus for sources the court did not cite. Never import model proposals as approvals."}
     write_jsonl(root / "bundles.jsonl", bundles())
-    write_jsonl(root / "independent_bundles.jsonl", ({"query_id": q["id"], "base_hash": query_hash(q),
-                "model_input": q["model_input"],
-                "sources": [store.get_unit(uid) for uid in sorted(q["annotation"]["pool_ids"])],
-                "instructions": "Independently assess the query and sources before opening model proposals or the judgment citation list."}
+    # The independent pass sees only the model input: answers come from the reviewer's own corpus search.
+    write_jsonl(root / "independent_bundles.jsonl", ({"query_id": q["id"], "base_hash": query_hash(q), "model_input": q["model_input"],
+                "instructions": "Find the governing provisions with the search/read commands before opening the comparison bundle."}
                 for q in queries))
     return {"queries": len(queries), "template": str(root / "template.jsonl"), "bundles": str(root / "bundles.jsonl")}
 
@@ -256,11 +252,46 @@ def accepted_review(query, store):
                   "review_hashes": [digest(r) for r in ordinary]}
 
 
+def fact_passages(facts):
+    """Judgment text is hard-wrapped (one PDF line per sentence unit): consecutive fact lines are rejoined."""
+    passages, previous = [], None
+    for fact in facts:
+        number = int(fact["sentence_id"][1:])
+        if previous is not None and number == previous + 1:
+            passages[-1] += " " + fact["text"]
+        else:
+            passages.append(fact["text"])
+        previous = number
+    return passages
+
+
+def model_view(query):
+    """What a benchmarked model may see: facts, issue, question and timeline only."""
+    return {"query_id": query["id"], "split": query["split"], "facts": fact_passages(query["model_input"]["facts"]),
+            "issue": query["model_input"]["issue"], "question": query["model_input"]["question"],
+            "timeline": query["model_input"]["timeline"], "corpus_snapshot_id": query["model_input"]["corpus_snapshot_id"]}
+
+
 def export_dataset(config, store, include_corpus=False):
     root = config.output_dir / "export"
     queries = list(active_queries(store))
+    run = store.get_meta("active_run")
     write_jsonl(root / "candidates.jsonl", queries)
-    write_jsonl(root / "failures.jsonl", (dict(r) for r in store.connection.execute("SELECT * FROM failures ORDER BY id")))
+    failures = [{"case_id": r["case_id"], "error_code": r["error_code"], **json.loads(r["result"] or "{}")} for r in store.connection.execute(
+        "SELECT case_id,error_code,result FROM annotations WHERE run_hash=? AND status='failed' ORDER BY case_id", (run,))]
+    write_jsonl(root / "failures.jsonl", failures)
+    silver = [q for q in queries if q["quality"] == "silver"]
+    write_jsonl(root / "silver_queries.jsonl", (model_view(q) for q in silver))
+    write_jsonl(root / "silver_qrels.jsonl", ({"query_id": q["id"], "answerability": q["target"]["answerability"],
+                "qrels": [{"unit_id": r["unit_id"], "grade": r["grade"], "evidence": r["evidence"]} for r in q["target"]["qrels"]],
+                "requirement_groups": [{"group_id": g["group_id"], "unit_ids": g["unit_ids"]} for g in q["target"]["requirement_groups"]]}
+                for q in silver))
+    write_jsonl(root / "silver_evidence.jsonl", ({"query_id": q["id"], "unit_id": e["unit_id"], "spans": e["spans"]}
+                                                 for q in silver for e in q["target"]["evidence"]))
+    write_jsonl(root / "silver_provenance.jsonl", ({"query_id": q["id"], "case_id": q["case_id"], "family_id": q["family_id"],
+                "confidence": q["confidence"], "review_status": q["review_status"], "label_sources": sorted({r["label_source"] for r in q["target"]["qrels"]}),
+                "review_reasons": q["annotation"]["review_reasons"], "sources": q["annotation"]["sources"],
+                "private_provenance": q["private_provenance"]} for q in silver))
     accepted, statuses = [], []
     for query in queries:
         review, status = accepted_review(query, store)
@@ -289,11 +320,24 @@ def export_dataset(config, store, include_corpus=False):
             for row in store.connection.execute("SELECT id FROM units WHERE parent_id IS NULL ORDER BY id"):
                 yield store.get_unit(row[0])
         corpus_count = write_jsonl(root / "corpus.jsonl", units())
-    report = {"run_hash": store.get_meta("active_run"), "snapshot": store.snapshot(),
-              "candidate_queries": len(queries), "gold_queries": len(accepted), "corpus_units_exported": corpus_count,
+    report = {"run_hash": run, "snapshot": store.snapshot(), "funnel": funnel(store, run, queries),
+              "candidate_queries": len(queries), "silver_queries": len(silver), "gold_queries": len(accepted), "corpus_units_exported": corpus_count,
+              "silver_policy": "Court-applied provisions resolved in the frozen corpus, confirmed by the EVIDENCE model with clause evidence; unreviewed",
               "gold_policy": "Two distinct agreeing human reviews or an independent adjudication resolving >=2 reviews; explicit version/evidence checks",
               "source_artifacts": [dict(r) for r in store.connection.execute("SELECT * FROM artifacts ORDER BY path")],
               "ingestion_complete": store.ingestion_complete(),
               "counts": store.counts()}
     (root / "manifest.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-    return report
+    return {k: v for k, v in report.items() if k != "source_artifacts"}
+
+
+def funnel(store, run, queries):
+    """Cases by outcome and reason, citation totals, and queries by quality/confidence for the active run."""
+    cases, citations = {}, {}
+    for row in store.connection.execute("SELECT status,error_code,result FROM annotations WHERE run_hash=?", (run,)):
+        key = row["status"] + (f":{row['error_code']}" if row["error_code"] else "")
+        cases[key] = cases.get(key, 0) + 1
+        for name, value in (json.loads(row["result"] or "{}").get("stats") or {}).items():
+            citations[name] = citations.get(name, 0) + value
+    by = lambda field: {v: sum(q[field] == v for q in queries) for v in sorted({q[field] for q in queries})}
+    return {"cases": cases, "citations": citations, "queries_by_quality": by("quality"), "queries_by_confidence": by("confidence")}

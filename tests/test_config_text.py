@@ -5,19 +5,19 @@ import pytest
 
 from legal_recall.config import ConfigError, load_config
 from legal_recall.contracts import PromptBank
-from legal_recall.text import document_number, header_number, iso_date, legal_units, leakage, normalize, quote_spans, sentences, window_text
+from legal_recall.text import document_number, header_number, iso_date, legal_units, leakage, normalize, quote_spans, sentences
 
 
 def test_env_paths_are_relative_to_env(fixture_env, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path.parent)
     c = load_config(fixture_env)
     assert c.judgment_path == fixture_env.parent / "cases"
-    assert c.profile("P1").auth_mode == "none"
-    assert c.profile("P1").temperature is None
-    assert "api_key" not in c.profile("P1").public()
+    assert c.profile("ISSUE").auth_mode == "none"
+    assert c.profile("ISSUE").temperature is None
+    assert "api_key" not in c.profile("ISSUE").public()
 
 
-@pytest.mark.parametrize("line", ["RR_TEST_AUTH_MODE=wrong", "RR_TEST_AUTH_MODE=bearer", "RR_TEST_OUTPUT_MODE=auto", "RR_TEST_TOKEN_PARAMETER=wrong", "RR_TRAIN_RATIO=0.9\nRR_DEV_RATIO=0.9", "RR_TEST_TEMPERATURE=3", "RR_PROFILE_P1=MISSING", "RR_TEST_BASE_URL=http://user:secret@example.test/v1", "RR_TEST_BASE_URL=http://example.test/v1/chat/completions", "RR_TEST_EXTRA_BODY={\"model\":\"override\"}", "RR_TEST_MAX_OUTPUT_TOKENS=999999", "RR_TEST_RETRIES=-1", "RR_TEST_MODALITIES=[\"audio\"]"])
+@pytest.mark.parametrize("line", ["RR_TEST_AUTH_MODE=wrong", "RR_TEST_AUTH_MODE=bearer", "RR_TEST_OUTPUT_MODE=auto", "RR_TEST_TOKEN_PARAMETER=wrong", "RR_TRAIN_RATIO=0.9\nRR_DEV_RATIO=0.9", "RR_TEST_TEMPERATURE=3", "RR_PROFILE_ISSUE=MISSING", "RR_TEST_BASE_URL=http://user:secret@example.test/v1", "RR_TEST_BASE_URL=http://example.test/v1/chat/completions", "RR_TEST_EXTRA_BODY={\"model\":\"override\"}", "RR_TEST_MAX_OUTPUT_TOKENS=999999", "RR_TEST_RETRIES=-1", "RR_TEST_MODALITIES=[\"audio\"]"])
 def test_invalid_config_rejected(fixture_env, line):
     fixture_env.write_text(fixture_env.read_text() + "\n" + line + "\n")
     with pytest.raises(ConfigError):
@@ -26,7 +26,23 @@ def test_invalid_config_rejected(fixture_env, line):
 
 def test_process_rr_environment_override(fixture_env, monkeypatch):
     monkeypatch.setenv("RR_TEST_MODEL", "other-model")
-    assert load_config(fixture_env).profile("P1").model == "other-model"
+    assert load_config(fixture_env).profile("ISSUE").model == "other-model"
+
+
+def test_langfuse_optional_and_secret_not_serialized(fixture_env):
+    assert load_config(fixture_env).langfuse_host is None
+    fixture_env.write_text(fixture_env.read_text() + "\nRR_LANGFUSE_HOST=http://127.0.0.1:3010/\nRR_LANGFUSE_PUBLIC_KEY=pk-lf-test\nRR_LANGFUSE_SECRET_KEY=sk-lf-private\n")
+    c = load_config(fixture_env)
+    assert c.langfuse_host == "http://127.0.0.1:3010" and c.langfuse_capture_io is False
+    assert "sk-lf-private" not in repr(c) and "sk-lf-private" not in json.dumps(c.public())
+
+
+@pytest.mark.parametrize("line", ["RR_LANGFUSE_HOST=http://127.0.0.1:3010", "RR_LANGFUSE_HOST=ftp://host\nRR_LANGFUSE_PUBLIC_KEY=a\nRR_LANGFUSE_SECRET_KEY=b",
+                                  "RR_LANGFUSE_HOST=http://h\nRR_LANGFUSE_PUBLIC_KEY=a\nRR_LANGFUSE_SECRET_KEY=b\nRR_LANGFUSE_CAPTURE_IO=maybe"])
+def test_invalid_langfuse_config_rejected(fixture_env, line):
+    fixture_env.write_text(fixture_env.read_text() + "\n" + line + "\n")
+    with pytest.raises(ConfigError):
+        load_config(fixture_env)
 
 
 def test_profile_auth_secret_not_serialized(fixture_env):
@@ -99,18 +115,37 @@ def test_factual_location_is_not_a_point_citation():
     assert leakage("Theo điểm a khoản 1 Điều 5")
 
 
-def test_windows_cover_without_gaps():
-    text = "a" * 300 + "\n" + "b" * 400
-    parts = list(window_text(text, 128))
-    assert "".join(p["text"] for p in parts) == text
-    assert all(p["end"] - p["start"] <= 128 for p in parts)
-
-
 def test_prompt_bank_and_fewshot_policy(fixture_env, tmp_path):
     c = load_config(fixture_env)
     bank = PromptBank(c.prompts_file)
-    assert {"P1", "P6", "P0V", "AUGMENT"} <= bank.prompts.keys()
+    assert {"ISSUE", "EVIDENCE", "P0V", "AUGMENT"} <= bank.prompts.keys()
+    assert bank.common.startswith("Bạn hỗ trợ annotation")
     f = tmp_path / "fewshot.json"
-    f.write_text('{"P2":[{"split":"test","human_reviewed":true,"input":{},"output":{}}]}')
+    f.write_text('{"ISSUE":[{"split":"test","human_reviewed":true,"input":{},"output":{}}]}')
     with pytest.raises(ValueError, match="train/dev"):
         PromptBank(c.prompts_file, f)
+
+
+@pytest.mark.parametrize("text", ["điều kiện để Tòa án chấp nhận đơn xin ly hôn khi một bên vắng mặt",
+                                  "liệu Tòa án chấp nhận yêu cầu chia tài sản trong trường hợp này không",
+                                  "Việc xác định tư cách tái phạm khi N đã bị Tòa án xử phạt 28 tháng tù"])
+def test_research_questions_are_not_outcome_leaks(text):
+    assert not leakage(text)
+
+
+@pytest.mark.parametrize("text", ["Tòa án chấp nhận yêu cầu khởi kiện của ông A", "Tòa án đã bác toàn bộ kháng cáo", "Tuyên xử: buộc B trả tiền"])
+def test_court_rulings_are_outcome_leaks(text):
+    assert leakage(text)
+
+
+def test_stage_output_caps_config(fixture_env):
+    assert load_config(fixture_env).stage_max_output_tokens == {}
+    fixture_env.write_text(fixture_env.read_text() + '\nRR_STAGE_MAX_OUTPUT_TOKENS={"ISSUE": 2048, "EVIDENCE": 1536}\n')
+    assert load_config(fixture_env).stage_max_output_tokens == {"ISSUE": 2048, "EVIDENCE": 1536}
+
+
+@pytest.mark.parametrize("line", ['RR_STAGE_MAX_OUTPUT_TOKENS={"P4": 1536}', 'RR_STAGE_MAX_OUTPUT_TOKENS={"EVIDENCE": 10}', "RR_STAGE_MAX_OUTPUT_TOKENS=[1]"])
+def test_invalid_stage_output_caps_rejected(fixture_env, line):
+    fixture_env.write_text(fixture_env.read_text() + "\n" + line + "\n")
+    with pytest.raises(ConfigError):
+        load_config(fixture_env)

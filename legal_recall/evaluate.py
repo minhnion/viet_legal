@@ -57,10 +57,12 @@ def score(gold, prediction, k):
             "unjudged_returned": sum(uid not in grades for uid in ranking)}
 
 
-def evaluate(export_dir, prediction_file, k=20):
+def evaluate(export_dir, prediction_file, k=20, labels="gold"):
     if k <= 0:
         raise ValueError("k must be positive")
-    gold = [json.loads(line) for line in (Path(export_dir) / "gold_qrels.jsonl").read_text().splitlines() if line.strip()]
+    if labels not in {"gold", "silver"}:
+        raise ValueError("labels must be gold or silver")
+    gold = [json.loads(line) for line in (Path(export_dir) / f"{labels}_qrels.jsonl").read_text().splitlines() if line.strip()]
     predictions = {}
     for line in Path(prediction_file).read_text().splitlines():
         if line.strip():
@@ -70,11 +72,11 @@ def evaluate(export_dir, prediction_file, k=20):
             predictions[item["query_id"]] = item
     unknown = predictions.keys() - {g["query_id"] for g in gold}
     if unknown:
-        raise ValueError("Predictions contain query IDs outside the exported gold set")
+        raise ValueError(f"Predictions contain query IDs outside the exported {labels} set")
     per_query = []
     for g in gold:
         if g["answerability"] == "answerable":
             per_query.append({"query_id": g["query_id"], **score(g, predictions.get(g["query_id"], {}), k)})
     metrics = {key: sum(r[key] for r in per_query) / len(per_query) for key in per_query[0] if key != "query_id"} if per_query else {}
-    return {"k": k, "answerable_queries": len(per_query), "metrics": metrics, "per_query": per_query,
+    return {"k": k, "labels": labels, "answerable_queries": len(per_query), "metrics": metrics, "per_query": per_query,
             "limitations": "Ranking scores are against judged qrels; unjudged results require review. Clarification queries excluded from ranking metrics."}

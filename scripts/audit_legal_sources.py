@@ -103,7 +103,7 @@ def audit_phapdien(root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("dataset/nguon-luat"))
-    parser.add_argument("--output", type=Path, default=Path("docs/rule_recall_legal_sources_audit.json"))
+    parser.add_argument("--output", type=Path, default=Path("outputs/audit/rule_recall_legal_sources_audit.json"))
     args = parser.parse_args()
     report = {
         "pyarrow_version": pa.__version__,

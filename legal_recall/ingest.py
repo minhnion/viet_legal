@@ -130,7 +130,63 @@ def build_laws(config, store):
                 if target["corpus"] == "tvpl":
                     store.connection.execute("INSERT OR IGNORE INTO crosswalk VALUES (?,?,?,?)", (row["id"], target["id"], "candidate_only",
                                              canonical({"method": "number_and_original_article", "source_note": json.loads(row["metadata"]).get("source_note_text")})))
+    build_acts(config, store)
+    with store.transaction():
+        store.set_meta("law_counts", {t: store.connection.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ["sources", "units"]})
     LOG.info("Law sources and units: %s", store.counts())
+
+
+ACT_TYPES = {"Bộ luật", "Luật", "Pháp lệnh", "Hiến pháp", "Nghị quyết", "Nghị quyết liên tịch", "Nghị định", "Thông tư", "Thông tư liên tịch"}
+TITLE_TYPES = [("Bộ luật", ["bo", "luat"]), ("Pháp lệnh", ["phap", "lenh"]), ("Hiến pháp", ["hien", "phap"]), ("Luật", ["luat"])]
+
+
+def act_name(title, doc_type):
+    """Name key of a named instrument from its TVPL title slug ("Bo luat Dan su 2005 33 2005 QH11" -> "dansu")
+    and whether the title is an amending act ("... sua doi ..."), which must not answer a bare name citation."""
+    words = re.findall(r"[^\W_]+", title or "")
+    tokens = [fold(w) for w in words]
+    prefix = dict(TITLE_TYPES).get(doc_type)
+    if not prefix or tokens[:len(prefix)] != prefix:
+        return None, False
+    rest = list(zip(words[len(prefix):], tokens[len(prefix):]))
+    # "Phap lenh 09 2014 UBTVQH13 trinh tu thu tuc ...": the name follows the number and issuer code.
+    while rest and (any(c.isdigit() for c in rest[0][1]) or (len(rest[0][0]) > 1 and rest[0][0].isupper())):
+        rest.pop(0)
+    name = []
+    for _, token in rest:
+        if any(c.isdigit() for c in token) or token in {"so", "nam"}:
+            break
+        name.append(token)
+    words = " ".join(tokens)
+    return ("".join(name) or None), (" sua doi" in " " + words or " bo sung" in " " + words)
+
+
+def build_acts(config, store):
+    """Instrument index for citation resolution: type, name, number and in-force dates of every ingested TVPL act.
+    Reads only small metadata columns from Parquet; numbers come from the ingested source rows (primary-key lookups)."""
+    columns = ["id", "doc_type", "title", "issue_date", "effective_date", "status", "is_english"]
+    rows = []
+    for path in document_files(config.tvpl_path):
+        pf = pq.ParquetFile(path)
+        for row in pf.read(columns=[c for c in columns if c in pf.schema_arrow.names]).to_pylist():
+            title = row.get("title") or ""
+            doc_type = row.get("doc_type") or ("Hiến pháp" if fold(title).startswith("hien phap") else None)
+            if doc_type not in ACT_TYPES or row.get("is_english"):
+                continue
+            source = store.connection.execute("SELECT number FROM sources WHERE id=?", ("tvpl:" + str(row.get("id")),)).fetchone()
+            if not source:
+                continue
+            name, amendment = act_name(title, doc_type)
+            status = row.get("status") or ""
+            expiry = re.search(r"Hết hiệu lực\s*:\s*(\d{1,2}/\d{1,2}/\d{4})", status)
+            number = source["number"]
+            rows.append(("tvpl:" + str(row["id"]), number, re.sub(r"\s+", "", fold(number)) if number else None, doc_type,
+                         name, title, iso_date(row.get("issue_date")), iso_date(row.get("effective_date")),
+                         iso_date(expiry.group(1)) if expiry else None, status, int(amendment)))
+    with store.transaction():
+        store.connection.execute("DELETE FROM acts")
+        store.connection.executemany("INSERT INTO acts VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+    LOG.info("Indexed %s instruments for citation resolution", len(rows))
 
 
 def build_cases(config, store):

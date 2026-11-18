@@ -21,7 +21,7 @@ import pyarrow.parquet as pq
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--corpus", type=Path, default=Path("dataset/ban-an"))
-    parser.add_argument("--output", type=Path, default=Path("docs/rule_recall_corpus_audit.json"))
+    parser.add_argument("--output", type=Path, default=Path("outputs/audit/rule_recall_corpus_audit.json"))
     parser.add_argument("--sample-size", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=20261115)
     args = parser.parse_args()

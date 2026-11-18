@@ -12,7 +12,11 @@ NUMBER_RE = re.compile(r"\b\d{1,5}\s*/\s*\d{4}\s*/\s*[A-Za-zĐđ0-9]+(?:[-–][A
 ARTICLE_RE = re.compile(r"(?mi)^[ \t]*(?:\*\*|#{1,6}\s*)?Điều\s+(\d+[a-zđ]?)[ \t]*[.:][ \t]*([^\n]*)")
 CLAUSE_RE = re.compile(r"(?m)^[ \t]*(\d+)\s*\.\s+(\S[^\n]*)")
 POINT_RE = re.compile(r"(?m)^[ \t]*([a-zđ])\)\s+(\S[^\n]*)")
-LAW_LEAK = re.compile(r"(?i)\b(?:điều|khoản)\s+\d+|\bđiểm\s+[a-zđ]\s+(?:khoản|điều)\s+\d+|\b(?:áp dụng|căn cứ)\s+(?:điều|bộ luật|luật)|\b(?:tuyên xử|tòa án (?:quyết định|chấp nhận|bác))\b")
+# Court-outcome signal: "Tòa án (quyết định) chấp nhận/bác <yêu cầu|kháng cáo|đơn>" is a ruling; the same verbs
+# inside a research question ("điều kiện để Tòa án chấp nhận đơn...", "liệu Tòa án có chấp nhận...") are not.
+LAW_LEAK = re.compile(r"(?i)\b(?:điều|khoản)\s+\d+|\bđiểm\s+[a-zđ]\s+(?:khoản|điều)\s+\d+|\b(?:áp dụng|căn cứ)\s+(?:điều|bộ luật|luật)"
+                      r"|\btuyên\s+xử\b"
+                      r"|(?<!\bđể )(?<!\bliệu )(?<!có thể )\btòa án\s+(?:(?:đã|quyết định|không)\s+)?(?:chấp nhận|bác)\s+(?:toàn bộ\s+|một phần\s+)?(?:yêu cầu|kháng cáo|kháng nghị|đơn)\b")
 DECISION_RE = re.compile(r"(?i)\b(?:tuyên xử|xử phạt|tòa án quyết định|hội đồng xét xử (?:nhận định|xét thấy)|áp dụng điều|căn cứ điều)\b")
 REASON_HEADING = re.compile(r"(?i)^(?:\[\d+\]\s*)?(?:NHẬN\s+ĐỊNH\s+CỦA\s+T[ÒO]A|XÉT\s+THẤY|QUYẾT\s+ĐỊNH\s*[:：]|TUYÊN\s+XỬ\s*[:：])")
 
@@ -145,17 +149,3 @@ def search_terms(text, limit=24):
     stop = {"va", "la", "cua", "cho", "voi", "cac", "nhung", "mot", "de", "duoc", "trong", "theo", "can", "nao", "tim", "nguon", "quy", "dinh", "phap", "luat"}
     counts = Counter(w for w in words if len(w) > 1 and w not in stop)
     return [w for w, _ in counts.most_common(limit)]
-
-
-def window_text(text, max_chars):
-    if max_chars < 32:
-        raise ValueError("Text window budget is too small")
-    start = 0
-    while start < len(text):
-        end = min(start + max_chars, len(text))
-        if end < len(text):
-            boundary = text.rfind("\n", start + max_chars // 2, end)
-            if boundary > start:
-                end = boundary + 1
-        yield {"start": start, "end": end, "text": text[start:end]}
-        start = end

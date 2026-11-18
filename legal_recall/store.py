@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS review_events(id INTEGER PRIMARY KEY, query_id TEXT N
  reviewer_id TEXT NOT NULL, review_hash TEXT NOT NULL, payload TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS failures(id INTEGER PRIMARY KEY, stage TEXT, item_id TEXT,
  error_code TEXT, message TEXT, created REAL);
+CREATE TABLE IF NOT EXISTS acts(id TEXT PRIMARY KEY REFERENCES sources(id), number TEXT, number_key TEXT,
+ doc_type TEXT NOT NULL, name_key TEXT, title TEXT, issue_date TEXT, effective_date TEXT, expiry_date TEXT,
+ status TEXT, is_amendment INTEGER NOT NULL);
 """
 
 
@@ -139,8 +142,28 @@ class Store:
                                 (stage, item_id, code, message, time.time()))
 
     def counts(self):
-        return {table: self.connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-                for table in ["sources", "units", "cases", "queries", "reviews", "failures"]}
+        # Law tables hold millions of rows: count(*) scans them, so build-laws stores their sizes once.
+        law = self.get_meta("law_counts") or {}
+        return {table: law[table] if table in law else self.connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                for table in ["sources", "units", "acts", "cases", "queries", "reviews", "failures"]}
+
+    def article_units(self, source_id, article):
+        rows = self.connection.execute("SELECT id FROM units WHERE source_id=? AND article=? AND parent_id IS NULL ORDER BY start",
+                                       (source_id, article)).fetchall()
+        return [self.get_unit(r[0]) for r in rows]
+
+    def clauses(self, unit):
+        rows = self.connection.execute("SELECT id FROM units WHERE source_id=? AND article=? AND parent_id=? ORDER BY start",
+                                       (unit["source_id"], unit["article"], unit["id"])).fetchall()
+        return [self.get_unit(r[0]) for r in rows]
+
+    def number_units(self, number, article, corpus):
+        """Top-level units of an article in sources whose number starts with `number` (TVPL also stores
+        translated pages under suffixed numbers such as 91/2015/QH13-THE-CIVIL-CODE)."""
+        rows = self.connection.execute("""SELECT u.id FROM units u JOIN sources s ON s.id=u.source_id
+            WHERE s.number>=? AND s.number<? AND s.corpus=? AND u.article=? AND u.parent_id IS NULL ORDER BY u.id""",
+            (number, number + "\U0010ffff", corpus, article)).fetchall()
+        return [u for u in (self.get_unit(r[0]) for r in rows) if u["number"] == number or u["number"].startswith(number + "-")]
 
     def versions(self, uid):
         unit = self.get_unit(uid)
